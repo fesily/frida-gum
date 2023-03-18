@@ -357,6 +357,7 @@ gum_darwin_symbolicator_details_from_address (GumDarwinSymbolicator * self,
   CSSymbolOwnerRef owner;
   const char * name;
   CSSourceInfoRef info;
+  CSRange range;
 
   symbol = CSSymbolicatorGetSymbolWithAddressAtTime (self->handle, address,
       kCSNow);
@@ -401,6 +402,12 @@ gum_darwin_symbolicator_details_from_address (GumDarwinSymbolicator * self,
     details->file_name[0] = '\0';
     details->line_number = 0;
     details->column = 0;
+  }
+
+  range = CSSymbolGetRange(symbol);
+  if (range.location != 0) {
+    details->range.base_address = range.location;
+    details->range.size = range.length;
   }
 
   return TRUE;

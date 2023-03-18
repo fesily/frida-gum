@@ -21,6 +21,7 @@ struct _GumDebugSymbolDetails
   gchar file_name[GUM_MAX_PATH + 1];
   guint line_number;
   guint column;
+  GumMemoryRange range;
 };
 
 G_BEGIN_DECLS
