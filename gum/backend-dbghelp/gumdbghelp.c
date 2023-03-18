@@ -94,6 +94,8 @@ static HMODULE
 load_dbghelp (void)
 {
   HMODULE mod;
+  if (GetModuleHandleExW(0, L"dbghelp.dll", &mod))
+      return mod;
   BOOL success G_GNUC_UNUSED;
   DWORD length G_GNUC_UNUSED;
   WCHAR path[MAX_PATH + 1] = { 0, };
