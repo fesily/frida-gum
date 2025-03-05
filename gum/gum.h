@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008-2021 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2008-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -16,6 +16,7 @@
 #include <gum/gumcodesegment.h>
 #include <gum/gumdarwingrafter.h>
 #include <gum/gumdarwinmodule.h>
+#include <gum/gumelfmodule.h>
 #include <gum/gumevent.h>
 #include <gum/gumeventsink.h>
 #include <gum/gumexceptor.h>
@@ -30,8 +31,10 @@
 #include <gum/gummemorymap.h>
 #include <gum/gummetalarray.h>
 #include <gum/gummetalhash.h>
+#include <gum/gummodule.h>
 #include <gum/gummoduleapiresolver.h>
 #include <gum/gummodulemap.h>
+#include <gum/gummoduleregistry.h>
 #include <gum/gumprintf.h>
 #include <gum/gumprocess.h>
 #include <gum/gumreturnaddress.h>

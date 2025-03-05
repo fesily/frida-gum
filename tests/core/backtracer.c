@@ -55,7 +55,9 @@ TESTCASE (basics)
   g_assert_true (g_str_has_suffix (rad.file_name, "backtracer.c"));
   g_assert_true (rad.line_number == expected_line_number ||
       rad.line_number == expected_line_number + 1);
+# if !(defined (HAVE_WINDOWS) && defined (HAVE_ARM64))
   g_assert_cmpuint (rad.column, ==, 3);
+# endif
 #endif
 }
 
@@ -75,10 +77,10 @@ TESTCASE (full_cycle_with_interceptor)
   open_impl = _open;
   close_impl = _close;
 #else
-  open_impl =
-      GSIZE_TO_POINTER (gum_module_find_export_by_name (NULL, "open"));
-  close_impl =
-      GSIZE_TO_POINTER (gum_module_find_export_by_name (NULL, "close"));
+  open_impl = GSIZE_TO_POINTER (
+      gum_module_find_export_by_name (gum_process_get_libc_module (), "open"));
+  close_impl = GSIZE_TO_POINTER (
+      gum_module_find_export_by_name (gum_process_get_libc_module (), "close"));
 #endif
 
   gum_interceptor_attach (interceptor, open_impl,

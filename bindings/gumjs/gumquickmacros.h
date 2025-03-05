@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2020-2025 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -14,6 +14,8 @@
         JSValueConst * argv);
 #define GUMJS_DECLARE_FINALIZER(N) \
     static void N (JSRuntime * rt, JSValue val);
+#define GUMJS_DECLARE_GC_MARKER(N) \
+    static void N (JSRuntime * rt, JSValueConst val, JS_MarkFunc * mark_func);
 #define GUMJS_DECLARE_FUNCTION(N) \
     static JSValue N (JSContext * ctx, JSValueConst this_val, int argc, \
         JSValueConst * argv);
@@ -188,5 +190,21 @@
               GumQuickArgs * args, \
               int flags, \
               GumQuickCore * core)
+#define GUMJS_INTERCEPTOR_IGNORE() \
+    { \
+      if (core->interceptor != NULL) \
+      { \
+        gum_interceptor_ignore_current_thread ( \
+            core->interceptor->interceptor); \
+      } \
+    }
+#define GUMJS_INTERCEPTOR_UNIGNORE() \
+    { \
+      if (core->interceptor != NULL) \
+      { \
+        gum_interceptor_unignore_current_thread ( \
+            core->interceptor->interceptor); \
+      } \
+    }
 
 #endif

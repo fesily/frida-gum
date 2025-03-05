@@ -1,12 +1,10 @@
 /*
- * Copyright (C) 2009-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2009-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2010-2013 Karl Trygve Kalleberg <karltk@boblycat.org>
  * Copyright (C) 2020      Duy Phan Thanh <phanthanhduypr@gmail.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
-
-#ifndef GUM_DIET
 
 #include "gumstalker.h"
 
@@ -16,6 +14,7 @@
 #include "gummemory.h"
 #include "gumx86relocator.h"
 #include "gumspinlock.h"
+#include "gumstalker-priv.h"
 #ifdef HAVE_WINDOWS
 # include "gumexceptor.h"
 #endif
@@ -33,7 +32,6 @@
 # define VC_EXTRALEAN
 # include <windows.h>
 # include <psapi.h>
-# include <tchar.h>
 #endif
 #ifdef HAVE_LINUX
 # include <sys/syscall.h>
@@ -724,10 +722,10 @@ static gboolean gum_exec_block_is_direct_jmp_to_plt_got (GumExecBlock * block,
 #ifdef HAVE_LINUX
 static GArray * gum_exec_ctx_get_plt_got_ranges (void);
 static void gum_exec_ctx_deinit_plt_got_ranges (void);
-static gboolean gum_exec_ctx_find_plt_got (const GumModuleDetails * details,
+static gboolean gum_collect_plt_got_in_module (GumModule * module,
     gpointer user_data);
-static gboolean gum_exec_check_elf_section (
-    const GumElfSectionDetails * details, gpointer user_data);
+static gboolean gum_collect_if_plt_got_section (
+    const GumSectionDetails * details, gpointer user_data);
 #endif
 static void gum_exec_block_handle_direct_jmp_to_plt_got (GumExecBlock * block,
     GumGeneratorContext * gc, GumBranchTarget * target);
@@ -764,6 +762,8 @@ static void gum_exec_block_write_jmp_transfer_code (GumExecBlock * block,
     GumGeneratorContext * gc, guint id, GumAddress jcc_address);
 static void gum_exec_block_write_ret_transfer_code (GumExecBlock * block,
     GumGeneratorContext * gc);
+static void gum_exec_block_write_chaining_return_code (GumExecBlock * block,
+    GumGeneratorContext * gc, guint16 npop);
 static gpointer * gum_exec_block_write_inline_cache_code (GumExecBlock * block,
     GumGeneratorContext * gc, GumX86Writer * cw, GumX86Writer * cws);
 static void gum_exec_block_backpatch_slab (GumExecBlock * block,
@@ -971,8 +971,8 @@ gum_stalker_init (GumStalker * self)
     guint8 * p;
     GArray * impls;
 
-    ntmod = GetModuleHandle (_T ("ntdll.dll"));
-    usermod = GetModuleHandle (_T ("user32.dll"));
+    ntmod = GetModuleHandleW (L"ntdll.dll");
+    usermod = GetModuleHandleW (L"user32.dll");
     g_assert (ntmod != NULL && usermod != NULL);
 
     success = GetModuleInformation (GetCurrentProcess (), usermod,
@@ -1011,9 +1011,9 @@ gum_stalker_init (GumStalker * self)
     self->wow_transition_impls = impls;
     gum_collect_export_by_handle (impls, ntmod, "Wow64Transition");
     gum_collect_export_by_handle (impls, usermod, "Wow64Transition");
-    gum_collect_export (impls, _T ("kernel32.dll"), "Wow64Transition");
-    gum_collect_export (impls, _T ("kernelbase.dll"), "Wow64Transition");
-    gum_collect_export (impls, _T ("win32u.dll"), "Wow64Transition");
+    gum_collect_export (impls, L"kernel32.dll", "Wow64Transition");
+    gum_collect_export (impls, L"kernelbase.dll", "Wow64Transition");
+    gum_collect_export (impls, L"win32u.dll", "Wow64Transition");
   }
 # endif
 #endif
@@ -1495,7 +1495,8 @@ gum_stalker_follow (GumStalker * self,
     ctx.transformer = transformer;
     ctx.sink = sink;
 
-    gum_process_modify_thread (thread_id, gum_stalker_infect, &ctx);
+    gum_process_modify_thread (thread_id, gum_stalker_infect, &ctx,
+        GUM_MODIFY_THREAD_FLAGS_NONE);
   }
 }
 
@@ -1526,7 +1527,8 @@ gum_stalker_unfollow (GumStalker * self,
       dc.exec_ctx = ctx;
       dc.success = FALSE;
 
-      gum_process_modify_thread (thread_id, gum_stalker_disinfect, &dc);
+      gum_process_modify_thread (thread_id, gum_stalker_disinfect, &dc,
+          GUM_MODIFY_THREAD_FLAGS_NONE);
 
       if (dc.success)
         gum_stalker_destroy_exec_ctx (self, ctx);
@@ -2005,7 +2007,8 @@ gum_stalker_do_invalidate (GumExecCtx * ctx,
     else
     {
       gum_process_modify_thread (ctx->thread_id,
-          gum_stalker_try_invalidate_block_owned_by_thread, &ic);
+          gum_stalker_try_invalidate_block_owned_by_thread, &ic,
+          GUM_MODIFY_THREAD_FLAGS_NONE);
     }
   }
 
@@ -2167,6 +2170,82 @@ gum_call_probe_unref (GumCallProbe * probe)
   {
     gum_call_probe_finalize (probe);
   }
+}
+
+void
+_gum_stalker_modify_to_run_on_thread (GumStalker * self,
+                                      GumThreadId thread_id,
+                                      GumCpuContext * cpu_context,
+                                      GumStalkerRunOnThreadFunc func,
+                                      gpointer data)
+{
+  GumExecCtx * ctx;
+  guint8 * pc;
+  GumX86Writer * cw;
+  GumAddress cpu_context_copy;
+
+  ctx = gum_stalker_create_exec_ctx (self, thread_id, NULL, NULL);
+
+  pc = GSIZE_TO_POINTER (GUM_CPU_CONTEXT_XIP (cpu_context));
+
+  gum_spinlock_acquire (&ctx->code_lock);
+
+  gum_stalker_thaw (self, ctx->thunks, self->thunks_size);
+  cw = &ctx->code_writer;
+  gum_x86_writer_reset (cw, ctx->infect_thunk);
+
+  cpu_context_copy = GUM_ADDRESS (gum_x86_writer_cur (cw));
+  gum_x86_writer_put_bytes (cw, (guint8 *) cpu_context, sizeof (GumCpuContext));
+
+#ifdef HAVE_LINUX
+  /*
+   * In case the thread is in a Linux system call we prefix with a couple of
+   * NOPs so that when we restart, we don't re-attempt the syscall. We will
+   * drop ourselves back to the syscall once we are done.
+   */
+  gum_x86_writer_put_nop_padding (cw, MAX (sizeof (gum_int80_code),
+      sizeof (gum_syscall_code)));
+#endif
+
+  ctx->infect_body = GUM_ADDRESS (gum_x86_writer_cur (cw));
+  gum_exec_ctx_write_prolog (ctx, GUM_PROLOG_MINIMAL, cw);
+  gum_x86_writer_put_call_address_with_aligned_arguments (cw, GUM_CALL_CAPI,
+      GUM_ADDRESS (func), 2,
+      GUM_ARG_ADDRESS, GUM_ADDRESS (cpu_context_copy),
+      GUM_ARG_ADDRESS, GUM_ADDRESS (data));
+  gum_x86_writer_put_call_address_with_aligned_arguments (cw, GUM_CALL_CAPI,
+      GUM_ADDRESS (gum_exec_ctx_unfollow), 2,
+      GUM_ARG_ADDRESS, GUM_ADDRESS (ctx),
+      GUM_ARG_ADDRESS, GUM_ADDRESS (pc));
+  gum_exec_ctx_write_epilog (ctx, GUM_PROLOG_MINIMAL, cw);
+
+#ifdef HAVE_LINUX
+  if (memcmp (&pc[-sizeof (gum_int80_code)], gum_int80_code,
+        sizeof (gum_int80_code)) == 0)
+  {
+    gum_x86_writer_put_jmp_address (cw,
+        GUM_ADDRESS (&pc[-sizeof (gum_int80_code)]));
+  }
+  else if (memcmp (&pc[-sizeof (gum_syscall_code)], gum_syscall_code,
+        sizeof (gum_syscall_code)) == 0)
+  {
+    gum_x86_writer_put_jmp_address (cw,
+        GUM_ADDRESS (&pc[-sizeof (gum_syscall_code)]));
+  }
+  else
+  {
+    gum_x86_writer_put_jmp_address (cw, GUM_ADDRESS (pc));
+  }
+#else
+  gum_x86_writer_put_jmp_address (cw, GUM_ADDRESS (pc));
+#endif
+
+  gum_x86_writer_flush (cw);
+  gum_stalker_freeze (self, cw->base, gum_x86_writer_offset (cw));
+
+  gum_spinlock_release (&ctx->code_lock);
+
+  GUM_CPU_CONTEXT_XIP (cpu_context) = ctx->infect_body;
 }
 
 static GumExecCtx *
@@ -2363,8 +2442,6 @@ gum_exec_ctx_new (GumStalker * stalker,
   ctx->mappings = gum_metal_hash_table_new (NULL, NULL);
 
   gum_exec_ctx_ensure_inline_helpers_reachable (ctx);
-
-  code_slab->invalidator = ctx->last_invalidator;
 
   ctx->depth = 0;
 
@@ -2885,6 +2962,7 @@ gum_exec_ctx_recompile_block (GumExecCtx * ctx,
   block->code_slab = ctx->scratch_slab;
   block->slow_slab = ctx->slow_slab;
   scratch_base = ctx->scratch_slab->slab.data;
+  ctx->scratch_slab->invalidator = slab->invalidator;
 
   gum_exec_ctx_compile_block (ctx, block, block->real_start, scratch_base,
       GUM_ADDRESS (internal_code), &input_size, &output_size, &slow_size);
@@ -3060,10 +3138,9 @@ gum_stalker_iterator_next (GumStalkerIterator * self,
       gc->continuation_real_address = instruction->end;
       return FALSE;
     }
-    else if (gum_x86_relocator_eob (rl))
-    {
+
+    if (!skip_implicitly_requested && gum_x86_relocator_eob (rl))
       return FALSE;
-    }
   }
 
   instruction = &self->instruction;
@@ -3162,6 +3239,12 @@ gum_stalker_iterator_keep (GumStalkerIterator * self)
   }
 
   self->requirements = requirements;
+}
+
+GumMemoryAccess
+gum_stalker_iterator_get_memory_access (GumStalkerIterator * self)
+{
+  return GUM_MEMORY_ACCESS_OPEN;
 }
 
 static void
@@ -3282,6 +3365,26 @@ gum_stalker_invoke_callout (GumCalloutEntry * entry,
   ec->pending_calls--;
 }
 
+void
+gum_stalker_iterator_put_chaining_return (GumStalkerIterator * self)
+{
+  GumExecBlock * block = self->exec_block;
+  GumGeneratorContext * gc = self->generator_context;
+
+  if ((block->ctx->sink_mask & GUM_RET) != 0)
+    gum_exec_block_write_ret_event_code (block, gc, GUM_CODE_INTERRUPTIBLE);
+
+  gum_exec_block_write_adjust_depth (block, gc->code_writer, -1);
+
+  gum_exec_block_write_chaining_return_code (block, gc, 0);
+}
+
+csh
+gum_stalker_iterator_get_capstone (GumStalkerIterator * self)
+{
+  return self->exec_context->relocator.capstone;
+}
+
 static void
 gum_exec_ctx_write_prolog (GumExecCtx * ctx,
                            GumPrologType type,
@@ -3389,6 +3492,7 @@ gum_exec_ctx_ensure_inline_helpers_reachable (GumExecCtx * ctx)
 
   gum_exec_ctx_ensure_helper_reachable (ctx, &ctx->last_invalidator,
       gum_exec_ctx_write_invalidator);
+  ctx->code_slab->invalidator = ctx->last_invalidator;
 
 #ifdef HAVE_LINUX
   gum_exec_ctx_ensure_helper_reachable (ctx, &ctx->last_int80,
@@ -4793,7 +4897,7 @@ gum_exec_ctx_get_plt_got_ranges (void)
   {
     GArray * ranges = g_array_new (FALSE, FALSE, sizeof (GumMemoryRange));
 
-    gum_process_enumerate_modules (gum_exec_ctx_find_plt_got, ranges);
+    gum_process_enumerate_modules (gum_collect_plt_got_in_module, ranges);
 
     _gum_register_early_destructor (gum_exec_ctx_deinit_plt_got_ranges);
 
@@ -4810,36 +4914,23 @@ gum_exec_ctx_deinit_plt_got_ranges (void)
 }
 
 static gboolean
-gum_exec_ctx_find_plt_got (const GumModuleDetails * details,
-                           gpointer user_data)
+gum_collect_plt_got_in_module (GumModule * module,
+                               gpointer user_data)
 {
   GArray * ranges = user_data;
-  GumElfModule * elf;
 
-  if (details->path == NULL)
-    return TRUE;
-
-  elf = gum_elf_module_new_from_memory (details->path,
-      details->range->base_address, NULL);
-  if (elf == NULL)
-    return TRUE;
-
-  gum_elf_module_enumerate_sections (elf, gum_exec_check_elf_section, ranges);
-
-  g_object_unref (elf);
+  gum_module_enumerate_sections (module, gum_collect_if_plt_got_section,
+      ranges);
 
   return TRUE;
 }
 
 static gboolean
-gum_exec_check_elf_section (const GumElfSectionDetails * details,
-                            gpointer user_data)
+gum_collect_if_plt_got_section (const GumSectionDetails * details,
+                                gpointer user_data)
 {
   GArray * ranges = user_data;
   GumMemoryRange range;
-
-  if (details->name == NULL)
-    return TRUE;
 
   if (strcmp (details->name, ".plt.got") != 0 &&
       strcmp (details->name, ".plt.sec") != 0)
@@ -5516,11 +5607,6 @@ gum_exec_block_write_ret_transfer_code (GumExecBlock * block,
   cs_x86 * x86 = &insn->ci->detail->x86;
   cs_x86_op * op = &x86->operands[0];
   guint16 npop = 0;
-  const gint trust_threshold = block->ctx->stalker->trust_threshold;
-  GumX86Writer * cw = gc->code_writer;
-  GumX86Writer * cws = gc->slow_writer;
-  gpointer * ic_match;
-  GumExecCtx * ctx = block->ctx;
 
   if (x86->op_count != 0)
   {
@@ -5529,6 +5615,20 @@ gum_exec_block_write_ret_transfer_code (GumExecBlock * block,
     g_assert (op->imm <= G_MAXUINT16);
     npop = op->imm;
   }
+
+  gum_exec_block_write_chaining_return_code (block, gc, npop);
+}
+
+static void
+gum_exec_block_write_chaining_return_code (GumExecBlock * block,
+                                           GumGeneratorContext * gc,
+                                           guint16 npop)
+{
+  const gint trust_threshold = block->ctx->stalker->trust_threshold;
+  GumX86Writer * cw = gc->code_writer;
+  GumX86Writer * cws = gc->slow_writer;
+  gpointer * ic_match;
+  GumExecCtx * ctx = block->ctx;
 
   if (trust_threshold >= 0)
   {
@@ -6542,12 +6642,11 @@ gum_find_thread_exit_implementation (void)
 {
 #if defined (HAVE_DARWIN)
   GumAddress result = 0;
-  const gchar * pthread_path = "/usr/lib/system/libsystem_pthread.dylib";
-  GumMemoryRange range;
+  GumModule * pthread;
   GumMatchPattern * pattern;
 
-  range.base_address = gum_module_find_base_address (pthread_path);
-  range.size = 128 * 1024;
+  pthread = gum_process_find_module_by_name (
+      "/usr/lib/system/libsystem_pthread.dylib");
 
   pattern = gum_match_pattern_new_from_string (
 #if GLIB_SIZEOF_VOID_P == 8
@@ -6582,29 +6681,38 @@ gum_find_thread_exit_implementation (void)
 #endif
   );
 
-  gum_memory_scan (&range, pattern, gum_store_thread_exit_match, &result);
+  gum_memory_scan (gum_module_get_range (pthread), pattern,
+      gum_store_thread_exit_match, &result);
 
   gum_match_pattern_unref (pattern);
 
   /* Non-public symbols are all <redacted> on iOS. */
 #ifndef HAVE_IOS
   if (result == 0)
-    result = gum_module_find_symbol_by_name (pthread_path, "_pthread_exit");
+    result = gum_module_find_symbol_by_name (pthread, "_pthread_exit");
 #endif
+
+  g_object_unref (pthread);
 
   return GSIZE_TO_POINTER (result);
 #elif defined (HAVE_GLIBC)
   return GSIZE_TO_POINTER (gum_module_find_export_by_name (
-        gum_process_query_libc_name (),
+        gum_process_get_libc_module (),
         "__call_tls_dtors"));
 #elif defined (HAVE_ANDROID)
   return GSIZE_TO_POINTER (gum_module_find_export_by_name (
-        gum_process_query_libc_name (),
+        gum_process_get_libc_module (),
         "pthread_exit"));
 #elif defined (HAVE_FREEBSD)
-  return GSIZE_TO_POINTER (gum_module_find_export_by_name (
-        "/lib/libthr.so.3",
-        "_pthread_exit"));
+  GumAddress result;
+  GumModule * libthr;
+
+  libthr = gum_process_find_module_by_name ("/lib/libthr.so.3");
+  g_assert (libthr != NULL);
+  result = gum_module_find_export_by_name (libthr, "_pthread_exit");
+  g_object_unref (libthr);
+
+  return GSIZE_TO_POINTER (result);
 #else
   return NULL;
 #endif
@@ -6623,7 +6731,5 @@ gum_store_thread_exit_match (GumAddress address,
 
   return FALSE;
 }
-
-#endif
 
 #endif

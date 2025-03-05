@@ -1,20 +1,32 @@
 project('frida-gum', 'c', 'cpp',
-  version: '1.0.0',
-  meson_version: '>=0.59.0',
+  version: run_command(find_program('python3'), files('tools' / 'detect-version.py'),
+    capture: true,
+    check: true).stdout().strip(),
+  meson_version: '>=1.1.0',
   default_options: [
-    'c_std=gnu99',
+    'c_std=gnu99,c99',
   ],
 )
 
-gum_version = meson.project_version()
+python = import('python').find_installation()
+
+releng = meson.global_source_root() / 'releng'
+if not import('fs').exists(releng)
+  releng = meson.project_source_root() / 'releng'
+endif
+
+frida_version = get_option('frida_version')
+if frida_version == ''
+  frida_version = run_command(python, files(releng / 'frida_version.py'), meson.project_source_root(), check: true).stdout().strip()
+endif
+
 api_version = '1.0'
 
-host_os = host_machine.system()
-if host_os == 'android'
+host_os_family = host_machine.system()
+if host_os_family == 'android'
   host_os_family = 'linux'
-else
-  host_os_family = host_os
 endif
+host_os = host_machine.subsystem().split('-')[0]
 if host_machine.cpu_family() == 'arm'
   host_arch = 'arm'
   host_abi = 'arm'
@@ -48,6 +60,10 @@ endif
 
 cc = meson.get_compiler('c')
 
+if cc.get_argument_syntax() == 'msvc' and host_arch == 'arm64'
+  add_languages('masm')
+endif
+
 frida_component_cflags = []
 ndebug = get_option('b_ndebug')
 optimize_for_prod = ndebug == 'true' or (ndebug == 'if-release' and not get_option('debug'))
@@ -71,30 +87,6 @@ if host_arch == 'arm'
 endif
 
 if host_os_family == 'darwin'
-  apple_os_flavors = [
-    ['macOS',   'OSX'],
-    ['iOS',     'IOS'],
-    ['watchOS', 'WATCH'],
-    ['tvOS',    'TV'],
-  ]
-  foreach candidate : apple_os_flavors
-    name = candidate[0]
-    constant = candidate[1]
-    if cc.compiles('''
-                   #include <TargetConditionals.h>
-                   #if !TARGET_OS_@0@
-                   # error Nope
-                   #endif
-                   '''.format(constant),
-                   name: f'compiling for @name@')
-      host_os = name.to_lower()
-      break
-    endif
-  endforeach
-  if host_os == 'darwin'
-    error('Unable to detect Apple OS flavor')
-  endif
-
   have_ptrauth_src = '''
 #ifdef __clang__
 # if __has_feature (ptrauth_calls)
@@ -115,8 +107,10 @@ else
   have_ptrauth = false
 endif
 
-if host_os_family == 'linux' and cc.has_header('android/api-level.h')
-  host_os = 'android'
+if cc.sizeof('void *') == 8
+  host_cpu_mode = '64'
+else
+  host_cpu_mode = '32'
 endif
 
 if host_os_family == 'windows'
@@ -136,10 +130,8 @@ extra_libs_private = []
 extra_gir_args_private = []
 
 cdata = configuration_data()
-cdata.set_quoted('GUM_VERSION', gum_version)
-if cc.get_define('FRIDA_VERSION') == ''
-  cdata.set_quoted('FRIDA_VERSION', gum_version)
-endif
+
+cdata.set_quoted('FRIDA_VERSION', frida_version)
 
 static = get_option('default_library') == 'static'
 if static
@@ -148,19 +140,12 @@ if static
 endif
 
 diet = get_option('diet')
-if diet
-  if not optimize_for_prod
-    error('Diet mode requires -Db_ndebug=true')
-  endif
-  extra_cflags += '-DGUM_DIET'
-  cdata.set('GUM_DIET', 1)
+if diet and not optimize_for_prod
+  error('Diet mode requires -Db_ndebug=true')
 endif
 
 gumpp_opt = get_option('gumpp')
 gumjs_opt = get_option('gumjs')
-if diet and (gumpp_opt.enabled() or gumjs_opt.enabled())
-  error('Bindings do not support diet mode (for now)')
-endif
 have_gumpp = not gumpp_opt.disabled()
 have_gumjs = not gumjs_opt.disabled()
 
@@ -179,7 +164,7 @@ if allocator == 'system'
   cdata.set('GUM_USE_SYSTEM_ALLOC', 1)
 endif
 
-have_jailbreak = get_option('jailbreak').allowed() and host_os in ['macos', 'ios']
+have_jailbreak = get_option('jailbreak').allowed() and host_os in ['macos', 'ios', 'tvos']
 if have_jailbreak
   cdata.set('HAVE_JAILBREAK', 1)
 endif
@@ -259,7 +244,8 @@ foreach t : types
   endif
 endforeach
 
-glibc_src = '''
+if host_os == 'linux'
+  glibc_src = '''
 #include <features.h>
 
 #if defined (__GLIBC__) && !defined (__UCLIBC__)
@@ -267,8 +253,20 @@ glibc_src = '''
 # error Not glibc
 #endif
 '''
-if cc.compiles(glibc_src, name: 'compiling for glibc')
-  cdata.set('HAVE_GLIBC', 1)
+  uclibc_src = '''
+#include <features.h>
+
+#if !defined (__UCLIBC__)
+# error Not uClibc
+#endif
+'''
+  if cc.compiles(glibc_src, name: 'compiling for glibc')
+    cdata.set('HAVE_GLIBC', 1)
+  elif cc.compiles(uclibc_src, name: 'compiling for uClibc')
+    cdata.set('HAVE_UCLIBC', 1)
+  else
+    cdata.set('HAVE_MUSL', 1)
+  endif
 endif
 
 if cc.has_member('struct mallinfo', 'arena', prefix: '#include <malloc.h>')
@@ -339,6 +337,16 @@ endif
 
 threads_dep = dependency('threads')
 
+if allocator == 'internal' or have_gumjs
+  ffi_options = [
+    'exe_static_tramp=false',
+    'tests=false',
+  ]
+  ffi_dep = dependency('libffi', default_options: ffi_options)
+else
+  ffi_dep = disabler()
+endif
+
 glib_options = [
   'diet=' + diet.to_string(),
   'printf=' + allocator,
@@ -356,15 +364,11 @@ if optimize_for_prod
     'glib_checks=false',
   ]
 endif
-glib_dep = dependency('glib-2.0', version: '>=2.56', default_options: glib_options)
-if not diet
-  gobject_dep = dependency('gobject-2.0', default_options: glib_options)
-else
-  gobject_dep = disabler()
-endif
+glib_dep = dependency('glib-2.0', version: '>=2.72', default_options: glib_options)
+gobject_dep = dependency('gobject-2.0')
 gio_os_package_name = (host_os_family == 'windows') ? 'gio-windows-2.0' : 'gio-unix-2.0'
 if have_gumjs
-  gio_dep = dependency('gio-2.0', default_options: glib_options)
+  gio_dep = dependency('gio-2.0')
   gio_os_package_dep = dependency(gio_os_package_name)
 else
   gio_dep = disabler()
@@ -383,19 +387,10 @@ capstone_options = [
 ]
 capstone_dep = dependency('capstone', version: '>=5.0.0', default_options: capstone_options)
 
-if allocator == 'internal' or have_gumjs
-  ffi_options = [
-    'tests=false',
-  ]
-  ffi_dep = dependency('libffi', default_options: ffi_options)
-else
-  ffi_dep = disabler()
-endif
-
-if build_tests
-  lzma_dep = dependency('liblzma')
-else
-  lzma_dep = disabler()
+lzma_dep = dependency('liblzma', required: build_tests)
+if lzma_dep.found()
+  cdata.set('HAVE_LZMA', 1)
+  extra_requires_private += 'liblzma'
 endif
 
 if glib_dep.type_name() == 'internal'
@@ -410,10 +405,43 @@ else
 '''
   have_shared_glib = cc.compiles(glib_flavor_src, name: 'compiling with shared GLib', dependencies: [glib_dep])
 endif
-if not static and not diet and have_shared_glib and not meson.is_cross_build()
-  gir = find_program('g-ir-scanner', required: false)
+if not static and have_shared_glib and not meson.is_cross_build()
+  gir_scanner = find_program('g-ir-scanner', required: false)
+  gir_dep = dependency('gobject-introspection-1.0', required: gir_scanner.found())
 else
-  gir = disabler()
+  gir_scanner = disabler()
+  gir_dep = disabler()
+endif
+
+if get_option('devkits').length() != 0
+  if not static
+    error('Devkits can only be generated from static libraries')
+  endif
+  mkdevkit = [python, releng / 'mkdevkit.py']
+  uninstalled_dir = meson.global_build_root() / 'meson-uninstalled'
+  devkit_options = [
+    '--cc', '>>>', cc.cmd_array(), '<<<',
+    '--c-args', '>>>', get_option('c_args'), '<<<',
+    '--pkg-config', '>>>', find_program('pkg-config'), '<<<',
+    '--pkg-config-path', '>>>', uninstalled_dir, get_option('pkg_config_path'), '<<<',
+  ]
+  if cc.get_argument_syntax() == 'msvc'
+    static_lib_prefix = ''
+    static_lib_suffix = '.lib'
+    devkit_options += ['--lib', '>>>', find_program('lib'), '<<<']
+  else
+    static_lib_prefix = 'lib'
+    static_lib_suffix = '.a'
+    foreach tool : ['ar', 'nm', 'objcopy']
+      p = find_program(tool, required: false)
+      if p.found()
+        devkit_options += ['--' + tool, p]
+      endif
+    endforeach
+  endif
+  if host_os_family == 'darwin'
+    devkit_options += ['--libtool', find_program('libtool')]
+  endif
 endif
 
 if glib_dep.type_name() == 'internal' or cc.has_function('g_thread_set_callbacks', dependencies: [glib_dep])
@@ -424,12 +452,18 @@ if ffi_dep.found() and (ffi_dep.type_name() == 'internal' or cc.has_function('ff
   cdata.set('HAVE_FRIDA_LIBFFI', 1)
 endif
 
-if cc.has_function('pthread_attr_getstack',
-    args: ['-D_GNU_SOURCE'],
-    dependencies: [threads_dep],
-    prefix: '#include <pthread.h>')
-  cdata.set('HAVE_PTHREAD_ATTR_GETSTACK', 1)
-endif
+pthread_functions = [
+  'pthread_attr_getstack',
+  'pthread_setname_np',
+]
+foreach f : pthread_functions
+  if cc.has_function(f,
+      args: ['-D_GNU_SOURCE'],
+      dependencies: [threads_dep],
+      prefix: '#include <pthread.h>')
+    cdata.set('HAVE_' + f.to_upper(), 1)
+  endif
+endforeach
 
 if host_os_family == 'windows'
   extra_deps += cc.find_library('psapi')
@@ -461,15 +495,6 @@ if host_os_family in ['linux', 'freebsd', 'qnx']
   cdata.set('HAVE_LIBUNWIND', 1)
   extra_requires_private += ['libunwind']
 
-  libelf_dep = dependency('libelf', required: false)
-  if not libelf_dep.found()
-    if cc.has_header('libelf.h')
-      libelf_dep = cc.find_library('elf')
-    else
-      libelf_dep = dependency('libelf', required: true)
-    endif
-  endif
-
   libdwarf_dep = dependency('libdwarf', required: false)
   if not libdwarf_dep.found()
     found = false
@@ -489,14 +514,17 @@ if host_os_family in ['linux', 'freebsd', 'qnx']
     endif
   endif
 
-  extra_deps += [libunwind_dep, libelf_dep, libdwarf_dep]
+  extra_deps += [libunwind_dep, libdwarf_dep]
 else
   libunwind_dep = disabler()
   libdwarf_dep = disabler()
 endif
 
 if host_os == 'android'
-  minizip_dep = dependency('minizip', required: false)
+  minizip_dep = dependency('minizip', required: false, default_options: [
+    'zlib=enabled',
+    'lzma=disabled',
+  ])
   if minizip_dep.found()
     cdata.set('HAVE_MINIZIP', 1)
     extra_deps += [minizip_dep]
@@ -504,7 +532,25 @@ if host_os == 'android'
   endif
 endif
 
-tls_provider_dep = dependency('gioopenssl', required: false)
+openssl_options = [
+  'cli=disabled',
+]
+if host_os_family == 'windows' and cc.get_argument_syntax() != 'msvc'
+  openssl_options += 'asm=disabled'
+endif
+dependency('openssl',
+  required: false,
+  modules: cc.get_argument_syntax() == 'msvc' ? ['OpenSSL::SSL'] : [],
+  default_options: openssl_options,
+)
+
+tls_provider_dep = dependency('gioopenssl', required: false, default_options: [
+  'gnutls=disabled',
+  'openssl=enabled',
+  'libproxy=disabled',
+  'gnome_proxy=disabled',
+  'tests=false',
+])
 if tls_provider_dep.found()
   cdata.set('HAVE_GIOOPENSSL', 1)
 endif
@@ -517,21 +563,31 @@ gumjs_extra_requires = []
 if have_gumjs
   cdata.set('HAVE_GUMJS', 1)
 
-  quickjs_dep = dependency('quickjs', required: get_option('quickjs'), allow_fallback: true, default_options: [
+  quickjs_options = [
     'libc=false',
     'bignum=true',
     'atomics=disabled',
     'stack_check=disabled',
-  ])
+  ]
+
+  quickjs_dep = dependency('quickjs', required: get_option('quickjs'), default_options: quickjs_options)
   cdata.set('HAVE_QUICKJS', quickjs_dep.found())
   if quickjs_dep.found()
     gumjs_extra_requires += 'quickjs'
-    quickjs_dep_native = dependency('quickjs', native: true)
+    quickjs_dep_native = dependency('quickjs', native: true, default_options: quickjs_options)
   endif
 
   v8_dep = dependency('v8-10.0',
     version: '>=10.6.122',
     required: get_option('v8'),
+    default_options: [
+      'debug=false',
+      'embedder_string=-frida',
+      'snapshot_compression=disabled',
+      'pointer_compression=disabled',
+      'shared_ro_heap=disabled',
+      'cppgc_caged_heap=disabled',
+    ],
   )
   cdata.set('HAVE_V8', v8_dep.found())
   if v8_dep.found()
@@ -584,6 +640,15 @@ if have_gumjs
     'tests=false',
     'sysprof=disabled',
   ])
+
+  node = find_program('node', version: '>=18.0.0', native: true, required: false)
+  if not node.found()
+    error('Need Node.js >= 18.0.0 to process JavaScript code at build time')
+  endif
+  npm = find_program('npm', native: true, required: false)
+  if not npm.found()
+    error('Need npm to process JavaScript code at build time')
+  endif
 else
   v8_dep = disabler()
 endif
@@ -601,9 +666,15 @@ add_project_arguments(
 
 if host_os_family == 'windows'
   add_project_arguments(
-    '-DWINVER=0x0501',
-    '-D_WIN32_WINNT=0x0501',
     '-DPSAPI_VERSION=1',
+    language: languages)
+endif
+
+if cc.get_argument_syntax() == 'msvc'
+  add_project_arguments(
+    '/wd4116',
+    '/wd4244',
+    '/wd5051',
     language: languages)
 endif
 
@@ -618,25 +689,45 @@ endif
 gum_incdirs = [
   include_directories('.'),
   include_directories('gum'),
-  include_directories('gum/arch-x86'),
-  include_directories('gum/arch-arm'),
-  include_directories('gum/arch-arm64'),
-  include_directories('gum/arch-mips'),
+  include_directories('gum' / 'arch-x86'),
+  include_directories('gum' / 'arch-arm'),
+  include_directories('gum' / 'arch-arm64'),
+  include_directories('gum' / 'arch-mips'),
   include_directories('libs'),
-  include_directories('libs/gum/heap'),
-  include_directories('libs/gum/prof'),
+  include_directories('libs' / 'gum' / 'heap'),
+  include_directories('libs' / 'gum' / 'prof'),
 ]
 
-if host_os_family == 'darwin'
+if host_os_family == 'windows'
   gum_incdirs += [
-    include_directories('gum/backend-darwin'),
+    include_directories('gum' / 'backend-windows' / 'include'),
+    include_directories('gum' / 'backend-dbghelp' / 'include'),
+    include_directories('ext' / 'dbghelp'),
   ]
 endif
 
-if host_os_family == 'linux' or host_os_family == 'qnx'
-  gum_incdirs += [
-    include_directories('gum/backend-elf'),
-  ]
+if host_os_family == 'darwin'
+  gum_incdirs += include_directories('gum' / 'backend-darwin' / 'include')
+endif
+
+if host_os_family == 'linux'
+  gum_incdirs += include_directories('gum' / 'backend-linux' / 'include')
+endif
+
+if host_os_family == 'freebsd'
+  gum_incdirs += include_directories('gum' / 'backend-freebsd' / 'include')
+endif
+
+if host_os_family == 'qnx'
+  gum_incdirs += include_directories('gum' / 'backend-qnx' / 'include')
+endif
+
+if host_executable_format == 'elf'
+  gum_incdirs += include_directories('gum' / 'backend-elf')
+endif
+
+if libunwind_dep.found()
+  gum_incdirs += include_directories('gum' / 'backend-libunwind' / 'include')
 endif
 
 install_header_basedir = 'frida-' + api_version
@@ -644,14 +735,10 @@ install_header_subdir = install_header_basedir + '/gum'
 
 subdir('ext')
 subdir('gum')
-if not diet
-  subdir('libs')
-  subdir('bindings')
-endif
+subdir('libs')
+subdir('bindings')
 subdir('vapi')
-if not diet
-  subdir('tools')
-endif
+subdir('tools')
 
 if build_tests
   subdir('tests')

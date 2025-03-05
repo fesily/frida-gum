@@ -1,6 +1,7 @@
 /*
- * Copyright (C) 2008-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2008-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2008 Christian Berentsen <jc.berentsen@gmail.com>
+ * Copyright (C) 2024 Francesco Tamagni <mrmacete@protonmail.ch>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -14,11 +15,12 @@
 G_BEGIN_DECLS
 
 #define GUM_TYPE_INTERCEPTOR (gum_interceptor_get_type ())
-GUM_DECLARE_FINAL_TYPE (GumInterceptor, gum_interceptor, GUM, INTERCEPTOR,
-                        GObject)
+G_DECLARE_FINAL_TYPE (GumInterceptor, gum_interceptor, GUM, INTERCEPTOR,
+                      GObject)
 
 typedef GArray GumInvocationStack;
 typedef guint GumInvocationState;
+typedef void (* GumInterceptorLockedFunc) (gpointer user_data);
 
 typedef enum
 {
@@ -60,6 +62,8 @@ GUM_API void gum_interceptor_end_transaction (GumInterceptor * self);
 GUM_API gboolean gum_interceptor_flush (GumInterceptor * self);
 
 GUM_API GumInvocationContext * gum_interceptor_get_current_invocation (void);
+GUM_API GumInvocationContext * gum_interceptor_get_live_replacement_invocation (
+    gpointer replacement_function);
 GUM_API GumInvocationStack * gum_interceptor_get_current_stack (void);
 
 GUM_API void gum_interceptor_ignore_current_thread (GumInterceptor * self);
@@ -75,6 +79,10 @@ GUM_API gpointer gum_invocation_stack_translate (GumInvocationStack * self,
 
 GUM_API void gum_interceptor_save (GumInvocationState * state);
 GUM_API void gum_interceptor_restore (GumInvocationState * state);
+
+GUM_API void gum_interceptor_with_lock_held (GumInterceptor * self,
+    GumInterceptorLockedFunc func, gpointer user_data);
+GUM_API gboolean gum_interceptor_is_locked (GumInterceptor * self);
 
 G_END_DECLS
 

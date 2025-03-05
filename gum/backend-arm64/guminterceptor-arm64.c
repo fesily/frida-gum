@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2014-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2022 Francesco Tamagni <mrmacete@protonmail.ch>
  *
  * Licence: wxWindows Library Licence, Version 3.1
@@ -10,15 +10,14 @@
 #include "gumarm64reader.h"
 #include "gumarm64relocator.h"
 #include "gumarm64writer.h"
+#include "gumcloak.h"
 #include "gumlibc.h"
 #include "gummemory.h"
 #ifdef HAVE_DARWIN
-# include "gumdarwin.h"
+# include "gum/gumdarwin.h"
 # include "gumdarwingrafter-priv.h"
 #endif
 
-#include <string.h>
-#include <unistd.h>
 #ifdef HAVE_DARWIN
 # include <dlfcn.h>
 # include <mach-o/dyld.h>
@@ -58,9 +57,6 @@ struct _GumArm64FunctionContextData
 
 G_STATIC_ASSERT (sizeof (GumArm64FunctionContextData)
     <= sizeof (GumFunctionContextBackendData));
-
-extern void _gum_interceptor_begin_invocation (void);
-extern void _gum_interceptor_end_invocation (void);
 
 static void gum_interceptor_backend_create_thunks (
     GumInterceptorBackend * self);
@@ -152,6 +148,9 @@ struct _GumGraftedSegmentPairDetails
   GumGraftedImport * imports;
   guint32 num_imports;
 };
+
+extern void _gum_interceptor_begin_invocation (void);
+extern void _gum_interceptor_end_invocation (void);
 
 static void gum_on_module_added (const struct mach_header * mh,
     intptr_t vmaddr_slide);
@@ -586,22 +585,28 @@ gum_compare_grafted_hook (const void * element_a,
 static gboolean
 gum_is_system_module (const gchar * path)
 {
-  static gboolean initialized = FALSE;
+  gboolean has_system_prefix;
+  static gboolean api_initialized = FALSE;
   static bool (* dsc_contains_path) (const char * path) = NULL;
 
-  if (!initialized)
+  has_system_prefix = g_str_has_prefix (path, "/System/") ||
+      g_str_has_prefix (path, "/usr/lib/") ||
+      g_str_has_prefix (path, "/Developer/") ||
+      g_str_has_prefix (path, "/private/preboot/");
+  if (has_system_prefix)
+    return TRUE;
+
+  if (!api_initialized)
   {
     dsc_contains_path =
         dlsym (RTLD_DEFAULT, "_dyld_shared_cache_contains_path");
-    initialized = TRUE;
+    api_initialized = TRUE;
   }
 
   if (dsc_contains_path != NULL)
     return dsc_contains_path (path);
 
-  return g_str_has_prefix (path, "/System/") ||
-      g_str_has_prefix (path, "/usr/lib/") ||
-      g_str_has_prefix (path, "/Developer/");
+  return FALSE;
 }
 
 #else
@@ -708,7 +713,8 @@ _gum_interceptor_backend_create_trampoline (GumInterceptorBackend * self,
   }
   else
   {
-    ctx->on_enter_trampoline = gum_sign_code_pointer (gum_arm64_writer_cur (aw));
+    ctx->on_enter_trampoline =
+        gum_sign_code_pointer (gum_arm64_writer_cur (aw));
     deflector_target = ctx->on_enter_trampoline;
   }
 
@@ -718,10 +724,11 @@ _gum_interceptor_backend_create_trampoline (GumInterceptorBackend * self,
     gpointer return_address;
     gboolean dedicated;
 
-    caller.near_address = function_address + data->redirect_code_size - 4;
+    caller.near_address =
+        (guint8 *) function_address + data->redirect_code_size - 4;
     caller.max_distance = GUM_ARM64_B_MAX_DISTANCE;
 
-    return_address = function_address + data->redirect_code_size;
+    return_address = (guint8 *) function_address + data->redirect_code_size;
 
     dedicated = data->redirect_code_size == 4;
 
@@ -803,8 +810,11 @@ _gum_interceptor_backend_create_trampoline (GumInterceptorBackend * self,
 
     while ((insn = gum_arm64_relocator_peek_next_write_insn (ar)) != NULL)
     {
+      const cs_arm64_op * source_op = &insn->detail->arm64.operands[1];
+
       if (insn->id == ARM64_INS_MOV &&
-          insn->detail->arm64.operands[1].reg == ARM64_REG_LR)
+          source_op->type == ARM64_OP_REG &&
+          source_op->reg == ARM64_REG_LR)
       {
         arm64_reg dst_reg = insn->detail->arm64.operands[0].reg;
         const guint reg_size = sizeof (gpointer);
@@ -950,12 +960,12 @@ _gum_interceptor_backend_activate_trampoline (GumInterceptorBackend * self,
         gum_arm64_writer_put_b_imm (aw, on_enter);
         break;
       case 8:
-        gum_arm64_writer_put_adrp_reg_address (aw, ARM64_REG_X16, on_enter);
-        gum_arm64_writer_put_br_reg_no_auth (aw, ARM64_REG_X16);
+        gum_arm64_writer_put_adrp_reg_address (aw, data->scratch_reg, on_enter);
+        gum_arm64_writer_put_br_reg_no_auth (aw, data->scratch_reg);
         break;
       case 16:
-        gum_arm64_writer_put_ldr_reg_address (aw, ARM64_REG_X16, on_enter);
-        gum_arm64_writer_put_br_reg (aw, ARM64_REG_X16);
+        gum_arm64_writer_put_ldr_reg_address (aw, data->scratch_reg, on_enter);
+        gum_arm64_writer_put_br_reg (aw, data->scratch_reg);
         break;
       default:
         g_assert_not_reached ();
@@ -1006,11 +1016,17 @@ static void
 gum_interceptor_backend_create_thunks (GumInterceptorBackend * self)
 {
   gsize page_size, code_size;
+  GumMemoryRange range;
 
   page_size = gum_query_page_size ();
   code_size = page_size;
 
   self->thunks = gum_memory_allocate (NULL, code_size, page_size, GUM_PAGE_RW);
+
+  range.base_address = GUM_ADDRESS (self->thunks);
+  range.size = code_size;
+  gum_cloak_add_range (&range);
+
   gum_memory_patch_code (self->thunks, 1024,
       (GumMemoryPatchApplyFunc) gum_emit_thunks, self);
 }
@@ -1145,5 +1161,9 @@ gum_emit_epilog (GumArm64Writer * aw)
     gum_arm64_writer_put_pop_reg_reg (aw, ARM64_REG_Q0 + i, ARM64_REG_Q1 + i);
 
   gum_arm64_writer_put_pop_reg_reg (aw, ARM64_REG_X16, ARM64_REG_X17);
+#ifndef HAVE_PTRAUTH
+  gum_arm64_writer_put_ret_reg (aw, ARM64_REG_X16);
+#else
   gum_arm64_writer_put_br_reg (aw, ARM64_REG_X16);
+#endif
 }

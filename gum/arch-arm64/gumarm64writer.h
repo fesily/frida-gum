@@ -1,6 +1,8 @@
 /*
- * Copyright (C) 2014-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
- * Copyright (C)      2017 Antonio Ken Iannillo <ak.iannillo@gmail.com>
+ * Copyright (C) 2014-2023 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2017 Antonio Ken Iannillo <ak.iannillo@gmail.com>
+ * Copyright (C) 2023 Håvard Sørbø <havard@hsorbo.no>
+ * Copyright (C) 2023 Fabian Freyer <fabian.freyer@physik.tu-berlin.de>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -17,16 +19,41 @@
 #define GUM_ARM64_ADRP_MAX_DISTANCE 0xfffff000
 #define GUM_ARM64_B_MAX_DISTANCE 0x07fffffc
 
+#define GUM_ARM64_SYSREG(op0, op1, crn, crm, op2) \
+    ( \
+      (((op0 == 2) ? 0 : 1) << 14) | \
+      (op1 << 11) | \
+      (crn << 7) | \
+      (crm << 3) | \
+      op2 \
+    )
+#define GUM_ARM64_SYSREG_TPIDRRO_EL0 GUM_ARM64_SYSREG (3, 3, 13, 0, 3)
+
 G_BEGIN_DECLS
 
 typedef struct _GumArm64Writer GumArm64Writer;
 typedef guint GumArm64IndexMode;
+
+/*
+ * Valid values:
+ * - G_LITTLE_ENDIAN
+ * - G_BIG_ENDIAN
+ * - G_BYTE_ORDER (an alias for one of the above)
+ */
+typedef int GumArm64DataEndian;
 
 struct _GumArm64Writer
 {
   volatile gint ref_count;
   gboolean flush_on_destroy;
 
+  /*
+   * Whilst instructions in AArch64 are always in little endian (even on
+   * big-endian systems), the data is in native endian. Thus since we wish to
+   * support writing code for big-endian systems on little-endian targets and
+   * vice versa, we need to check the writer configuration before writing data.
+   */
+  GumArm64DataEndian data_endian;
   GumOS target_os;
   GumPtrauthSupport ptrauth_support;
   GumAddress (* sign) (GumAddress value);
@@ -103,6 +130,8 @@ GUM_API gboolean gum_arm64_writer_put_blr_reg (GumArm64Writer * self,
 GUM_API gboolean gum_arm64_writer_put_blr_reg_no_auth (GumArm64Writer * self,
     arm64_reg reg);
 GUM_API void gum_arm64_writer_put_ret (GumArm64Writer * self);
+GUM_API gboolean gum_arm64_writer_put_ret_reg (GumArm64Writer * self,
+    arm64_reg reg);
 GUM_API gboolean gum_arm64_writer_put_cbz_reg_imm (GumArm64Writer * self,
     arm64_reg reg, GumAddress target);
 GUM_API gboolean gum_arm64_writer_put_cbnz_reg_imm (GumArm64Writer * self,
@@ -186,6 +215,14 @@ GUM_API gboolean gum_arm64_writer_put_sub_reg_reg_reg (GumArm64Writer * self,
     arm64_reg dst_reg, arm64_reg left_reg, arm64_reg right_reg);
 GUM_API gboolean gum_arm64_writer_put_and_reg_reg_imm (GumArm64Writer * self,
     arm64_reg dst_reg, arm64_reg left_reg, guint64 right_value);
+GUM_API gboolean gum_arm64_writer_put_eor_reg_reg_reg (GumArm64Writer * self,
+    arm64_reg dst_reg, arm64_reg left_reg, arm64_reg right_reg);
+GUM_API gboolean gum_arm64_writer_put_ubfm (GumArm64Writer * self,
+    arm64_reg dst_reg, arm64_reg src_reg, guint8 imms, guint8 immr);
+GUM_API gboolean gum_arm64_writer_put_lsl_reg_imm (GumArm64Writer * self,
+    arm64_reg dst_reg, arm64_reg src_reg, guint8 shift);
+GUM_API gboolean gum_arm64_writer_put_lsr_reg_imm (GumArm64Writer * self,
+    arm64_reg dst_reg, arm64_reg src_reg, guint8 shift);
 GUM_API gboolean gum_arm64_writer_put_tst_reg_imm (GumArm64Writer * self,
     arm64_reg reg, guint64 imm_value);
 GUM_API gboolean gum_arm64_writer_put_cmp_reg_reg (GumArm64Writer * self,
@@ -196,6 +233,8 @@ GUM_API gboolean gum_arm64_writer_put_xpaci_reg (GumArm64Writer * self,
 
 GUM_API void gum_arm64_writer_put_nop (GumArm64Writer * self);
 GUM_API void gum_arm64_writer_put_brk_imm (GumArm64Writer * self, guint16 imm);
+GUM_API gboolean gum_arm64_writer_put_mrs (GumArm64Writer * self,
+    arm64_reg dst_reg, guint16 system_reg);
 
 GUM_API void gum_arm64_writer_put_instruction (GumArm64Writer * self,
     guint32 insn);

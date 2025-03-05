@@ -55,10 +55,33 @@ namespace Gum {
 		INVALID_DATA,
 	}
 
+	[CCode (cprefix = "GUM_TEARDOWN_REQUIREMENT_")]
+	public enum TeardownRequirement {
+		FULL,
+		MINIMAL
+	}
+
 	[CCode (cprefix = "GUM_CODE_SIGNING_")]
 	public enum CodeSigningPolicy {
 		OPTIONAL,
 		REQUIRED
+	}
+
+	public enum ModifyThreadFlags {
+		NONE,
+		ABORT_SAFELY,
+	}
+
+	public enum OS {
+		WINDOWS,
+		MACOS,
+		LINUX,
+		IOS,
+		WATCHOS,
+		TVOS,
+		ANDROID,
+		FREEBSD,
+		QNX,
 	}
 
 	[CCode (cprefix = "GUM_CALL_")]
@@ -66,6 +89,8 @@ namespace Gum {
 		CAPI,
 		SYSAPI
 	}
+
+	public const CpuType NATIVE_CPU;
 
 	[CCode (cprefix = "GUM_CPU_")]
 	public enum CpuType {
@@ -77,12 +102,31 @@ namespace Gum {
 		MIPS,
 	}
 
+	public struct Argument {
+		public Gum.ArgType type;
+		public Gum.ArgValue value;
+	}
+
+	[CCode (cprefix = "GUM_ARG_")]
+	public enum ArgType {
+		ADDRESS,
+		REGISTER
+	}
+
+	public struct ArgValue {
+		Gum.Address address;
+		int reg;
+	}
+
 	[CCode (cprefix = "GUM_PTRAUTH_")]
 	public enum PtrauthSupport {
 		INVALID,
 		UNSUPPORTED,
 		SUPPORTED
 	}
+
+	[CCode (has_target = false)]
+	public delegate Gum.Address PtrauthSignFunc (Gum.Address val);
 
 	[CCode (cprefix = "GUM_RWX_")]
 	public enum RwxSupport {
@@ -112,6 +156,11 @@ namespace Gum {
 
 		public void ignore_other_threads ();
 		public void unignore_other_threads ();
+
+		public void with_lock_held (Gum.Interceptor.LockedFunc func);
+		public bool is_locked ();
+
+		public delegate void LockedFunc ();
 	}
 
 	[CCode (type_cname = "GumInvocationListenerInterface")]
@@ -238,15 +287,20 @@ namespace Gum {
 	}
 
 	namespace Process {
+		public Gum.TeardownRequirement get_teardown_requirement ();
+		public void set_teardown_requirement (Gum.TeardownRequirement requirement);
 		public Gum.CodeSigningPolicy get_code_signing_policy ();
 		public void set_code_signing_policy (Gum.CodeSigningPolicy policy);
-		public unowned string query_libc_name ();
 		public bool is_debugger_attached ();
 		public Gum.ProcessId get_id ();
 		public Gum.ThreadId get_current_thread_id ();
 		public bool has_thread (Gum.ThreadId thread_id);
-		public bool modify_thread (Gum.ThreadId thread_id, Gum.ModifyThreadFunc func);
+		public bool modify_thread (Gum.ThreadId thread_id, Gum.ModifyThreadFunc func, Gum.ModifyThreadFlags flags = NONE);
 		public void enumerate_threads (Gum.FoundThreadFunc func);
+		public unowned Module get_main_module ();
+		public unowned Module? get_libc_module ();
+		public Module? find_module_by_name (string name);
+		public Module? find_module_by_address (Gum.Address address);
 		public void enumerate_modules (Gum.FoundModuleFunc func);
 		public void enumerate_ranges (Gum.PageProtection prot, Gum.FoundRangeFunc func);
 		public Gum.HeapApiList find_heap_apis ();
@@ -281,18 +335,36 @@ namespace Gum {
 		public bool resume (Gum.ThreadId thread_id) throws Gum.Error;
 	}
 
-	namespace Module {
-		public bool ensure_initialized (string module_name);
-		public void enumerate_imports (string module_name, Gum.FoundImportFunc func);
-		public void enumerate_exports (string module_name, Gum.FoundExportFunc func);
-		public void enumerate_symbols (string module_name, Gum.FoundSymbolFunc func);
-		public void enumerate_ranges (string module_name, Gum.PageProtection prot, Gum.FoundRangeFunc func);
-		public void * find_base_address (string module_name);
-		public void * find_export_by_name (string? module_name, string symbol_name);
+	public interface Module : GLib.Object {
+		public string name { get; }
+		public string path { get; }
+		public Gum.MemoryRange? range { get; }
+
+		public static Module load (string module_name) throws Gum.Error;
+
+		public abstract void ensure_initialized ();
+		public abstract void enumerate_imports (Gum.FoundImportFunc func);
+		public abstract void enumerate_exports (Gum.FoundExportFunc func);
+		public abstract void enumerate_symbols (Gum.FoundSymbolFunc func);
+		public abstract void enumerate_ranges (Gum.PageProtection prot, Gum.FoundRangeFunc func);
+		public abstract void enumerate_sections (Gum.FoundSectionFunc func);
+		public abstract void enumerate_dependencies (Gum.FoundDependencyFunc func);
+		public abstract Gum.Address find_export_by_name (string symbol_name);
+		public static Gum.Address find_global_export_by_name (string symbol_name);
+		public abstract Gum.Address find_symbol_by_name (string symbol_name);
+	}
+
+	public class ModuleMap : GLib.Object {
+		public ModuleMap ();
+
+		public unowned Gum.Module? find (Gum.Address address);
+
+		public void update ();
 	}
 
 	namespace Memory {
 		public bool is_readable (void * address, size_t len);
+		public bool query_protection (void * address, out Gum.PageProtection prot);
 		public uint8[] read (Address address, size_t len);
 		public bool write (Address address, uint8[] bytes);
 		public bool patch_code (void * address, size_t size, Gum.Memory.PatchApplyFunc apply);
@@ -331,9 +403,13 @@ namespace Gum {
 		public bool has_file_descriptor (int fd);
 		public void enumerate_file_descriptors (Gum.Cloak.FoundFDFunc func);
 
+		public void with_lock_held (Gum.Cloak.LockedFunc func);
+		public bool is_locked ();
+
 		public delegate bool FoundThreadFunc (Gum.ThreadId id);
 		public delegate bool FoundRangeFunc (Gum.MemoryRange range);
 		public delegate bool FoundFDFunc (int fd);
+		public delegate void LockedFunc ();
 	}
 
 	public struct CpuContext {
@@ -389,14 +465,24 @@ namespace Gum {
 		public uint32 lr;
 	}
 
+	public struct Arm64VectorReg {
+		public uint8 q[16];
+		public double d;
+		public float s;
+		public uint16 h;
+		public uint8 b;
+	}
+
 	public struct Arm64CpuContext {
 		public uint64 pc;
 		public uint64 sp;
+		public uint64 nzcv;
 
 		public uint64 x[29];
 		public uint64 fp;
 		public uint64 lr;
-		public uint8 q[128];
+
+		public Gum.Arm64VectorReg v[32];
 	}
 
 	public struct MipsCpuContext {
@@ -444,13 +530,21 @@ namespace Gum {
 		public uint32 k1;
 	}
 
+	[CCode (cprefix = "GUM_SCENARIO_")]
+	public enum RelocationScenario {
+		OFFLINE,
+		ONLINE
+	}
+
 	public delegate void ModifyThreadFunc (Gum.ThreadId thread_id, CpuContext * cpu_context);
 	public delegate bool FoundThreadFunc (Gum.ThreadDetails details);
-	public delegate bool FoundModuleFunc (Gum.ModuleDetails details);
+	public delegate bool FoundModuleFunc (Gum.Module module);
 	public delegate bool FoundRangeFunc (Gum.RangeDetails details);
 	public delegate bool FoundImportFunc (Gum.ImportDetails details);
 	public delegate bool FoundExportFunc (Gum.ExportDetails details);
 	public delegate bool FoundSymbolFunc (Gum.SymbolDetails details);
+	public delegate bool FoundSectionFunc (Gum.SectionDetails details);
+	public delegate bool FoundDependencyFunc (Gum.DependencyDetails details);
 
 	public struct ProcessId : uint {
 	}
@@ -473,12 +567,6 @@ namespace Gum {
 		public CpuContext cpu_context;
 	}
 
-	public struct ModuleDetails {
-		public string name;
-		public Gum.MemoryRange? range;
-		public string path;
-	}
-
 	[CCode (cprefix = "GUM_IMPORT_")]
 	public enum ImportType {
 		FUNCTION = 1,
@@ -490,6 +578,7 @@ namespace Gum {
 		public string name;
 		public string module;
 		public Gum.Address address;
+		public Gum.Address slot;
 	}
 
 	[CCode (cprefix = "GUM_EXPORT_")]
@@ -536,6 +625,26 @@ namespace Gum {
 	public struct FileMapping {
 		public string path;
 		public uint64 offset;
+	}
+
+	public struct SectionDetails {
+		public string id;
+		public string name;
+		public Gum.Address address;
+		public ssize_t size;
+	}
+
+	[CCode (cprefix = "GUM_DEPENDENCY_")]
+	public enum DependencyType {
+		REGULAR,
+		WEAK,
+		REEXPORT,
+		UPWARD,
+	}
+
+	public struct DependencyDetails {
+		public string name;
+		public Gum.DependencyType type;
 	}
 
 	public struct Address : uint64 {
@@ -652,6 +761,953 @@ namespace Gum {
 		public void * location;
 	}
 
+	public class ElfModule : GLib.Object {
+		public ElfModule.from_file (string path) throws Gum.Error;
+		public ElfModule.from_blob (GLib.Bytes blob) throws Gum.Error;
+		public ElfModule.from_memory (string path, Gum.Address base_address) throws Gum.Error;
+
+		public bool load () throws Gum.Error;
+
+		public Gum.ElfType etype { get; }
+		public uint pointer_size { get; }
+		public GLib.ByteOrder byte_order { get; }
+		public Gum.ElfOSABI os_abi { get; }
+		public uint8 os_abi_version { get; }
+		public Gum.ElfMachine machine { get; }
+		public Gum.Address base_address { get; }
+		public Gum.Address preferred_address { get; }
+		public uint64 mapped_size { get; }
+		public Gum.Address entrypoint { get; }
+		public string interpreter { get; }
+		public unowned string? source_path { get; }
+		public unowned GLib.Bytes? source_blob { get; }
+		public Gum.ElfSourceMode source_mode { get; }
+
+		[CCode (array_length_type = "size_t")]
+		public unowned uint8[] get_file_data ();
+
+		public void enumerate_segments (Gum.FoundElfSegmentFunc func);
+		public void enumerate_sections (Gum.FoundElfSectionFunc func);
+		public void enumerate_relocations (Gum.FoundElfRelocationFunc func);
+		public void enumerate_dynamic_entries (Gum.FoundElfDynamicEntryFunc func);
+		public void enumerate_dependencies (Gum.FoundDependencyFunc func);
+		public void enumerate_imports (Gum.FoundImportFunc func);
+		public void enumerate_exports (Gum.FoundExportFunc func);
+		public void enumerate_dynamic_symbols (Gum.FoundElfSymbolFunc func);
+		public void enumerate_symbols (Gum.FoundElfSymbolFunc func);
+
+		public Gum.Address translate_to_offline (Gum.Address online_address);
+		public Gum.Address translate_to_online (Gum.Address offline_address);
+	}
+
+	[CCode (cprefix = "GUM_ELF_")]
+	public enum ElfType {
+		NONE,
+		REL,
+		EXEC,
+		DYN,
+		CORE,
+	}
+
+	[CCode (cprefix = "GUM_ELF_OS_")]
+	public enum ElfOSABI {
+		SYSV,
+		HPUX,
+		NETBSD,
+		LINUX,
+		SOLARIS,
+		AIX,
+		IRIX,
+		FREEBSD,
+		TRU64,
+		MODESTO,
+		OPENBSD,
+		ARM_AEABI,
+		ARM,
+		STANDALONE,
+	}
+
+	public enum ElfMachine {
+		NONE,
+
+		M32,
+		SPARC,
+		@386,
+		68K,
+		88K,
+		IAMCU,
+		@860,
+		MIPS,
+		S370,
+		MIPS_RS3_LE,
+
+		PARISC,
+
+		VPP500,
+		SPARC32PLUS,
+		@960,
+		PPC,
+		PPC64,
+		S390,
+		SPU,
+
+		V800,
+		FR20,
+		RH32,
+		RCE,
+		ARM,
+		FAKE_ALPHA,
+		SH,
+		SPARCV9,
+		TRICORE,
+		ARC,
+		H8_300,
+		H8_300H,
+		H8S,
+		H8_500,
+		IA_64,
+		MIPS_X,
+		COLDFIRE,
+		68HC12,
+		MMA,
+		PCP,
+		NCPU,
+		NDR1,
+		STARCORE,
+		ME16,
+		ST100,
+		TINYJ,
+		X86_64,
+		PDSP,
+		PDP10,
+		PDP11,
+		FX66,
+		ST9PLUS,
+		ST7,
+		68HC16,
+		68HC11,
+		68HC08,
+		68HC05,
+		SVX,
+		ST19,
+		VAX,
+		CRIS,
+		JAVELIN,
+		FIREPATH,
+		ZSP,
+		MMIX,
+		HUANY,
+		PRISM,
+		AVR,
+		FR30,
+		D10V,
+		D30V,
+		V850,
+		M32R,
+		MN10300,
+		MN10200,
+		PJ,
+		OPENRISC,
+		ARC_COMPACT,
+		XTENSA,
+		VIDEOCORE,
+		TMM_GPP,
+		NS32K,
+		TPC,
+		SNP1K,
+		ST200,
+		IP2K,
+		MAX,
+		CR,
+		F2MC16,
+		MSP430,
+		BLACKFIN,
+		SE_C33,
+		SEP,
+		ARCA,
+		UNICORE,
+		EXCESS,
+		DXP,
+		ALTERA_NIOS2,
+		CRX,
+		XGATE,
+		C166,
+		M16C,
+		DSPIC30F,
+		CE,
+		M32C,
+
+		TSK3000,
+		RS08,
+		SHARC,
+		ECOG2,
+		SCORE7,
+		DSP24,
+		VIDEOCORE3,
+		LATTICEMICO32,
+		SE_C17,
+		TI_C6000,
+		TI_C2000,
+		TI_C5500,
+		TI_ARP32,
+		TI_PRU,
+
+		MMDSP_PLUS,
+		CYPRESS_M8C,
+		R32C,
+		TRIMEDIA,
+		QDSP6,
+		@8051,
+		STXP7X,
+		NDS32,
+		ECOG1X,
+		MAXQ30,
+		XIMO16,
+		MANIK,
+		CRAYNV2,
+		RX,
+		METAG,
+		MCST_ELBRUS,
+		ECOG16,
+		CR16,
+		ETPU,
+		SLE9X,
+		L10M,
+		K10M,
+
+		AARCH64,
+
+		AVR32,
+		STM8,
+		TILE64,
+		TILEPRO,
+		MICROBLAZE,
+		CUDA,
+		TILEGX,
+		CLOUDSHIELD,
+		COREA_1ST,
+		COREA_2ND,
+		ARCV2,
+		OPEN8,
+		RL78,
+		VIDEOCORE5,
+		78KOR,
+		@56800EX,
+		BA1,
+		BA2,
+		XCORE,
+		MCHP_PIC,
+
+		KM32,
+		KMX32,
+		EMX16,
+		EMX8,
+		KVARC,
+		CDP,
+		COGE,
+		COOL,
+		NORC,
+		CSR_KALIMBA,
+		Z80,
+		VISIUM,
+		FT32,
+		MOXIE,
+		AMDGPU,
+
+		RISCV,
+
+		BPF,
+
+		CSKY,
+
+		ALPHA,
+	}
+
+	public enum ElfSourceMode {
+		OFFLINE,
+		ONLINE,
+	}
+
+	public delegate bool FoundElfSegmentFunc (Gum.ElfSegmentDetails details);
+	public delegate bool FoundElfSectionFunc (Gum.ElfSectionDetails details);
+	public delegate bool FoundElfRelocationFunc (Gum.ElfRelocationDetails details);
+	public delegate bool FoundElfDynamicEntryFunc (Gum.ElfDynamicEntryDetails details);
+	public delegate bool FoundElfSymbolFunc (Gum.ElfSymbolDetails details);
+
+	public struct ElfSegmentDetails {
+		public Gum.Address vm_address;
+		public uint64 vm_size;
+		public uint64 file_offset;
+		public uint64 file_size;
+		public Gum.DarwinPageProtection protection;
+	}
+
+	public struct ElfSectionDetails {
+		public string id;
+		public string name;
+		public Gum.ElfSectionType type;
+		public uint64 flags;
+		public Gum.Address address;
+		public uint64 offset;
+		public size_t size;
+		public uint32 link;
+		public uint32 info;
+		public uint64 alignment;
+		public uint64 entry_size;
+		public Gum.PageProtection protection;
+	}
+
+	public struct ElfRelocationDetails {
+		public Gum.Address address;
+		public uint32 type;
+		public Gum.ElfSymbolDetails? symbol;
+		public int64 addend;
+		public Gum.ElfSectionDetails? parent;
+	}
+
+	public struct ElfDynamicEntryDetails {
+		public Gum.ElfDynamicTag tag;
+		public uint64 val;
+	}
+
+	public struct ElfSymbolDetails {
+		public string name;
+		public Gum.Address address;
+		public size_t size;
+		public Gum.ElfSymbolType type;
+		public Gum.ElfSymbolBind bind;
+		public Gum.ElfSectionDetails? section;
+	}
+
+	[CCode (cprefix = "GUM_ELF_SECTION_")]
+	public enum ElfSectionType {
+		NULL,
+		PROGBITS,
+		SYMTAB,
+		STRTAB,
+		RELA,
+		HASH,
+		DYNAMIC,
+		NOTE,
+		NOBITS,
+		REL,
+		SHLIB,
+		DYNSYM,
+		INIT_ARRAY,
+		FINI_ARRAY,
+		PREINIT_ARRAY,
+		GROUP,
+		SYMTAB_SHNDX,
+		RELR,
+		NUM,
+		GNU_ATTRIBUTES,
+		GNU_HASH,
+		GNU_LIBLIST,
+		CHECKSUM,
+		SUNW_MOVE,
+		SUNW_COMDAT,
+		SUNW_SYMINFO,
+		GNU_VERDEF,
+		GNU_VERNEED,
+		GNU_VERSYM,
+	}
+
+	[CCode (cprefix = "GUM_ELF_DYNAMIC_")]
+	public enum ElfDynamicTag {
+		NULL,
+		NEEDED,
+		PLTRELSZ,
+		PLTGOT,
+		HASH,
+		STRTAB,
+		SYMTAB,
+		RELA,
+		RELASZ,
+		RELAENT,
+		STRSZ,
+		SYMENT,
+		INIT,
+		FINI,
+		SONAME,
+		RPATH,
+		SYMBOLIC,
+		REL,
+		RELSZ,
+		RELENT,
+		PLTREL,
+		DEBUG,
+		TEXTREL,
+		JMPREL,
+		BIND_NOW,
+		INIT_ARRAY,
+		FINI_ARRAY,
+		INIT_ARRAYSZ,
+		FINI_ARRAYSZ,
+		RUNPATH,
+		FLAGS,
+		ENCODING,
+		PREINIT_ARRAY,
+		PREINIT_ARRAYSZ,
+		MAXPOSTAGS,
+		LOOS,
+		SUNW_AUXILIARY,
+		SUNW_RTLDINF,
+		SUNW_FILTER,
+		SUNW_CAP,
+		SUNW_ASLR,
+		HIOS,
+
+		VALRNGLO,
+		GNU_PRELINKED,
+		GNU_CONFLICTSZ,
+		GNU_LIBLISTSZ,
+		CHECKSUM,
+		PLTPADSZ,
+		MOVEENT,
+		MOVESZ,
+		FEATURE,
+		FEATURE_1,
+		POSFLAG_1,
+
+		SYMINSZ,
+		SYMINENT,
+		VALRNGHI,
+
+		ADDRRNGLO,
+		GNU_HASH,
+		TLSDESC_PLT,
+		TLSDESC_GOT,
+		GNU_CONFLICT,
+		GNU_LIBLIST,
+		CONFIG,
+		DEPAUDIT,
+		AUDIT,
+		PLTPAD,
+		MOVETAB,
+		SYMINFO,
+		ADDRRNGHI,
+
+		VERSYM,
+		RELACOUNT,
+		RELCOUNT,
+		FLAGS_1,
+		VERDEF,
+		VERDEFNUM,
+		VERNEED,
+		VERNEEDNUM,
+
+		LOPROC,
+
+		ARM_SYMTABSZ,
+		ARM_PREEMPTMAP,
+
+		SPARC_REGISTER,
+		DEPRECATED_SPARC_REGISTER,
+
+		MIPS_RLD_VERSION,
+		MIPS_TIME_STAMP,
+		MIPS_ICHECKSUM,
+		MIPS_IVERSION,
+		MIPS_FLAGS,
+		MIPS_BASE_ADDRESS,
+		MIPS_CONFLICT,
+		MIPS_LIBLIST,
+		MIPS_LOCAL_GOTNO,
+		MIPS_CONFLICTNO,
+		MIPS_LIBLISTNO,
+		MIPS_SYMTABNO,
+		MIPS_UNREFEXTNO,
+		MIPS_GOTSYM,
+		MIPS_HIPAGENO,
+		MIPS_RLD_MAP,
+		MIPS_DELTA_CLASS,
+		MIPS_DELTA_CLASS_NO,
+		MIPS_DELTA_INSTANCE,
+		MIPS_DELTA_INSTANCE_NO,
+		MIPS_DELTA_RELOC,
+		MIPS_DELTA_RELOC_NO,
+		MIPS_DELTA_SYM,
+		MIPS_DELTA_SYM_NO,
+		MIPS_DELTA_CLASSSYM,
+		MIPS_DELTA_CLASSSYM_NO,
+		MIPS_CXX_FLAGS,
+		MIPS_PIXIE_INIT,
+		MIPS_SYMBOL_LIB,
+		MIPS_LOCALPAGE_GOTIDX,
+		MIPS_LOCAL_GOTIDX,
+		MIPS_HIDDEN_GOTIDX,
+		MIPS_PROTECTED_GOTIDX,
+		MIPS_OPTIONS,
+		MIPS_INTERFACE,
+		MIPS_DYNSTR_ALIGN,
+		MIPS_INTERFACE_SIZE,
+		MIPS_RLD_TEXT_RESOLVE_ADDR,
+		MIPS_PERF_SUFFIX,
+		MIPS_COMPACT_SIZE,
+		MIPS_GP_VALUE,
+		MIPS_AUX_DYNAMIC,
+		MIPS_PLTGOT,
+		MIPS_RLD_OBJ_UPDATE,
+		MIPS_RWPLT,
+		MIPS_RLD_MAP_REL,
+
+		PPC_GOT,
+		PPC_TLSOPT,
+
+		PPC64_GLINK,
+		PPC64_OPD,
+		PPC64_OPDSZ,
+		PPC64_TLSOPT,
+
+		AUXILIARY,
+		USED,
+		FILTER,
+		HIPROC,
+	}
+
+	[CCode (cprefix = "GUM_ELF_SYMBOL_")]
+	public enum ElfSymbolType {
+		NOTYPE,
+		OBJECT,
+		FUNC,
+		SECTION,
+		FILE,
+		COMMON,
+		TLS,
+		NUM,
+		LOOS,
+		GNU_IFUNC,
+		HIOS,
+		LOPROC,
+		SPARC_REGISTER,
+		HIPROC,
+	}
+
+	[CCode (cprefix = "GUM_ELF_BIND_")]
+	public enum ElfSymbolBind {
+		LOCAL,
+		GLOBAL,
+		WEAK,
+		LOOS,
+		GNU_UNIQUE,
+		HIOS,
+		LOPROC,
+		HIPROC,
+	}
+
+	[CCode (cprefix = "GUM_ELF_IA32_")]
+	public enum ElfIA32Relocation {
+		NONE,
+		@32,
+		PC32,
+		GOT32,
+		PLT32,
+		COPY,
+		GLOB_DAT,
+		JMP_SLOT,
+		RELATIVE,
+		GOTOFF,
+		GOTPC,
+		32PLT,
+		TLS_TPOFF,
+		TLS_IE,
+		TLS_GOTIE,
+		TLS_LE,
+		TLS_GD,
+		TLS_LDM,
+		@16,
+		PC16,
+		@8,
+		PC8,
+		TLS_GD_32,
+		TLS_GD_PUSH,
+		TLS_GD_CALL,
+		TLS_GD_POP,
+		TLS_LDM_32,
+		TLS_LDM_PUSH,
+		TLS_LDM_CALL,
+		TLS_LDM_POP,
+		TLS_LDO_32,
+		TLS_IE_32,
+		TLS_LE_32,
+		TLS_DTPMOD32,
+		TLS_DTPOFF32,
+		TLS_TPOFF32,
+		SIZE32,
+		TLS_GOTDESC,
+		TLS_DESC_CALL,
+		TLS_DESC,
+		IRELATIVE,
+		GOT32X,
+	}
+
+	[CCode (cprefix = "GUM_ELF_X64_")]
+	public enum ElfX64Relocation {
+		NONE,
+		@64,
+		PC32,
+		GOT32,
+		PLT32,
+		COPY,
+		GLOB_DAT,
+		JUMP_SLOT,
+		RELATIVE,
+		GOTPCREL,
+		@32,
+		@32S,
+		@16,
+		PC16,
+		@8,
+		PC8,
+		DTPMOD64,
+		DTPOFF64,
+		TPOFF64,
+		TLSGD,
+		TLSLD,
+		DTPOFF32,
+		GOTTPOFF,
+		TPOFF32,
+		PC64,
+		GOTOFF64,
+		GOTPC32,
+		GOT64,
+		GOTPCREL64,
+		GOTPC64,
+		GOTPLT64,
+		PLTOFF64,
+		SIZE32,
+		SIZE64,
+		GOTPC32_TLSDESC,
+		TLSDESC_CALL,
+		TLSDESC,
+		IRELATIVE,
+		RELATIVE64,
+		GOTPCRELX,
+		REX_GOTPCRELX,
+	}
+
+	[CCode (cprefix = "GUM_ELF_ARM_")]
+	public enum ElfArmRelocation {
+		NONE,
+		PC24,
+		ABS32,
+		REL32,
+		PC13,
+		ABS16,
+		ABS12,
+		THM_ABS5,
+		ABS8,
+		SBREL32,
+		THM_PC22,
+		THM_PC8,
+		AMP_VCALL9,
+		SWI24,
+		TLS_DESC,
+		THM_SWI8,
+		XPC25,
+		THM_XPC22,
+		TLS_DTPMOD32,
+		TLS_DTPOFF32,
+		TLS_TPOFF32,
+		COPY,
+		GLOB_DAT,
+		JUMP_SLOT,
+		RELATIVE,
+		GOTOFF,
+		GOTPC,
+		GOT32,
+		PLT32,
+		CALL,
+		JUMP24,
+		THM_JUMP24,
+		BASE_ABS,
+		ALU_PCREL_7_0,
+		ALU_PCREL_15_8,
+		ALU_PCREL_23_15,
+		LDR_SBREL_11_0,
+		ALU_SBREL_19_12,
+		ALU_SBREL_27_20,
+		TARGET1,
+		SBREL31,
+		V4BX,
+		TARGET2,
+		PREL31,
+		MOVW_ABS_NC,
+		MOVT_ABS,
+		MOVW_PREL_NC,
+		MOVT_PREL,
+		THM_MOVW_ABS_NC,
+		THM_MOVT_ABS,
+		THM_MOVW_PREL_NC,
+		THM_MOVT_PREL,
+		THM_JUMP19,
+		THM_JUMP6,
+		THM_ALU_PREL_11_0,
+		THM_PC12,
+		ABS32_NOI,
+		REL32_NOI,
+		ALU_PC_G0_NC,
+		ALU_PC_G0,
+		ALU_PC_G1_NC,
+		ALU_PC_G1,
+		ALU_PC_G2,
+		LDR_PC_G1,
+		LDR_PC_G2,
+		LDRS_PC_G0,
+		LDRS_PC_G1,
+		LDRS_PC_G2,
+		LDC_PC_G0,
+		LDC_PC_G1,
+		LDC_PC_G2,
+		ALU_SB_G0_NC,
+		ALU_SB_G0,
+		ALU_SB_G1_NC,
+		ALU_SB_G1,
+		ALU_SB_G2,
+		LDR_SB_G0,
+		LDR_SB_G1,
+		LDR_SB_G2,
+		LDRS_SB_G0,
+		LDRS_SB_G1,
+		LDRS_SB_G2,
+		LDC_SB_G0,
+		LDC_SB_G1,
+		LDC_SB_G2,
+		MOVW_BREL_NC,
+		MOVT_BREL,
+		MOVW_BREL,
+		THM_MOVW_BREL_NC,
+		THM_MOVT_BREL,
+		THM_MOVW_BREL,
+		TLS_GOTDESC,
+		TLS_CALL,
+		TLS_DESCSEQ,
+		THM_TLS_CALL,
+		PLT32_ABS,
+		GOT_ABS,
+		GOT_PREL,
+		GOT_BREL12,
+		GOTOFF12,
+		GOTRELAX,
+		GNU_VTENTRY,
+		GNU_VTINHERIT,
+		THM_PC11,
+		THM_PC9,
+		TLS_GD32,
+		TLS_LDM32,
+		TLS_LDO32,
+		TLS_IE32,
+		TLS_LE32,
+		TLS_LDO12,
+		TLS_LE12,
+		TLS_IE12GP,
+		ME_TOO,
+		THM_TLS_DESCSEQ,
+		THM_TLS_DESCSEQ16,
+		THM_TLS_DESCSEQ32,
+		THM_GOT_BREL12,
+		IRELATIVE,
+		RXPC25,
+		RSBREL32,
+		THM_RPC22,
+		RREL32,
+		RABS22,
+		RPC24,
+		RBASE,
+	}
+
+	[CCode (cprefix = "GUM_ELF_ARM64_")]
+	public enum ElfArm64Relocation {
+		NONE,
+		P32_ABS32,
+		P32_COPY,
+		P32_GLOB_DAT,
+		P32_JUMP_SLOT,
+		P32_RELATIVE,
+		P32_TLS_DTPMOD,
+		P32_TLS_DTPREL,
+		P32_TLS_TPREL,
+		P32_TLSDESC,
+		P32_IRELATIVE,
+		ABS64,
+		ABS32,
+		ABS16,
+		PREL64,
+		PREL32,
+		PREL16,
+		MOVW_UABS_G0,
+		MOVW_UABS_G0_NC,
+		MOVW_UABS_G1,
+		MOVW_UABS_G1_NC,
+		MOVW_UABS_G2,
+		MOVW_UABS_G2_NC,
+		MOVW_UABS_G3,
+		MOVW_SABS_G0,
+		MOVW_SABS_G1,
+		MOVW_SABS_G2,
+		LD_PREL_LO19,
+		ADR_PREL_LO21,
+		ADR_PREL_PG_HI21,
+		ADR_PREL_PG_HI21_NC,
+		ADD_ABS_LO12_NC,
+		LDST8_ABS_LO12_NC,
+		TSTBR14,
+		CONDBR19,
+		JUMP26,
+		CALL26,
+		LDST16_ABS_LO12_NC,
+		LDST32_ABS_LO12_NC,
+		LDST64_ABS_LO12_NC,
+		MOVW_PREL_G0,
+		MOVW_PREL_G0_NC,
+		MOVW_PREL_G1,
+		MOVW_PREL_G1_NC,
+		MOVW_PREL_G2,
+		MOVW_PREL_G2_NC,
+		MOVW_PREL_G3,
+		LDST128_ABS_LO12_NC,
+		MOVW_GOTOFF_G0,
+		MOVW_GOTOFF_G0_NC,
+		MOVW_GOTOFF_G1,
+		MOVW_GOTOFF_G1_NC,
+		MOVW_GOTOFF_G2,
+		MOVW_GOTOFF_G2_NC,
+		MOVW_GOTOFF_G3,
+		GOTREL64,
+		GOTREL32,
+		GOT_LD_PREL19,
+		LD64_GOTOFF_LO15,
+		ADR_GOT_PAGE,
+		LD64_GOT_LO12_NC,
+		LD64_GOTPAGE_LO15,
+		TLSGD_ADR_PREL21,
+		TLSGD_ADR_PAGE21,
+		TLSGD_ADD_LO12_NC,
+		TLSGD_MOVW_G1,
+		TLSGD_MOVW_G0_NC,
+		TLSLD_ADR_PREL21,
+		TLSLD_ADR_PAGE21,
+		TLSLD_ADD_LO12_NC,
+		TLSLD_MOVW_G1,
+		TLSLD_MOVW_G0_NC,
+		TLSLD_LD_PREL19,
+		TLSLD_MOVW_DTPREL_G2,
+		TLSLD_MOVW_DTPREL_G1,
+		TLSLD_MOVW_DTPREL_G1_NC,
+		TLSLD_MOVW_DTPREL_G0,
+		TLSLD_MOVW_DTPREL_G0_NC,
+		TLSLD_ADD_DTPREL_HI12,
+		TLSLD_ADD_DTPREL_LO12,
+		TLSLD_ADD_DTPREL_LO12_NC,
+		TLSLD_LDST8_DTPREL_LO12,
+		TLSLD_LDST8_DTPREL_LO12_NC,
+		TLSLD_LDST16_DTPREL_LO12,
+		TLSLD_LDST16_DTPREL_LO12_NC,
+		TLSLD_LDST32_DTPREL_LO12,
+		TLSLD_LDST32_DTPREL_LO12_NC,
+		TLSLD_LDST64_DTPREL_LO12,
+		TLSLD_LDST64_DTPREL_LO12_NC,
+		TLSIE_MOVW_GOTTPREL_G1,
+		TLSIE_MOVW_GOTTPREL_G0_NC,
+		TLSIE_ADR_GOTTPREL_PAGE21,
+		TLSIE_LD64_GOTTPREL_LO12_NC,
+		TLSIE_LD_GOTTPREL_PREL19,
+		TLSLE_MOVW_TPREL_G2,
+		TLSLE_MOVW_TPREL_G1,
+		TLSLE_MOVW_TPREL_G1_NC,
+		TLSLE_MOVW_TPREL_G0,
+		TLSLE_MOVW_TPREL_G0_NC,
+		TLSLE_ADD_TPREL_HI12,
+		TLSLE_ADD_TPREL_LO12,
+		TLSLE_ADD_TPREL_LO12_NC,
+		TLSLE_LDST8_TPREL_LO12,
+		TLSLE_LDST8_TPREL_LO12_NC,
+		TLSLE_LDST16_TPREL_LO12,
+		TLSLE_LDST16_TPREL_LO12_NC,
+		TLSLE_LDST32_TPREL_LO12,
+		TLSLE_LDST32_TPREL_LO12_NC,
+		TLSLE_LDST64_TPREL_LO12,
+		TLSLE_LDST64_TPREL_LO12_NC,
+		TLSDESC_LD_PREL19,
+		TLSDESC_ADR_PREL21,
+		TLSDESC_ADR_PAGE21,
+		TLSDESC_LD64_LO12,
+		TLSDESC_ADD_LO12,
+		TLSDESC_OFF_G1,
+		TLSDESC_OFF_G0_NC,
+		TLSDESC_LDR,
+		TLSDESC_ADD,
+		TLSDESC_CALL,
+		TLSLE_LDST128_TPREL_LO12,
+		TLSLE_LDST128_TPREL_LO12_NC,
+		TLSLD_LDST128_DTPREL_LO12,
+		TLSLD_LDST128_DTPREL_LO12_NC,
+		COPY,
+		GLOB_DAT,
+		JUMP_SLOT,
+		RELATIVE,
+		TLS_DTPMOD,
+		TLS_DTPREL,
+		TLS_TPREL,
+		TLSDESC,
+		IRELATIVE,
+	}
+
+	[CCode (cprefix = "GUM_ELF_MIPS_")]
+	public enum ElfMipsRelocation {
+		NONE,
+		@16,
+		@32,
+		REL32,
+		@26,
+		HI16,
+		LO16,
+		GPREL16,
+		LITERAL,
+		GOT16,
+		PC16,
+		CALL16,
+		GPREL32,
+		SHIFT5,
+		SHIFT6,
+		@64,
+		GOT_DISP,
+		GOT_PAGE,
+		GOT_OFST,
+		GOT_HI16,
+		GOT_LO16,
+		SUB,
+		INSERT_A,
+		INSERT_B,
+		DELETE,
+		HIGHER,
+		HIGHEST,
+		CALL_HI16,
+		CALL_LO16,
+		SCN_DISP,
+		REL16,
+		ADD_IMMEDIATE,
+		PJUMP,
+		RELGOT,
+		JALR,
+		TLS_DTPMOD32,
+		TLS_DTPREL32,
+		TLS_DTPMOD64,
+		TLS_DTPREL64,
+		TLS_GD,
+		TLS_LDM,
+		TLS_DTPREL_HI16,
+		TLS_DTPREL_LO16,
+		TLS_GOTTPREL,
+		TLS_TPREL32,
+		TLS_TPREL64,
+		TLS_TPREL_HI16,
+		TLS_TPREL_LO16,
+		GLOB_DAT,
+		COPY,
+		JUMP_SLOT,
+	}
+
 	public class DarwinModule : GLib.Object {
 		public Filetype filetype;
 		public string? name;
@@ -726,7 +1782,7 @@ namespace Gum {
 		public void enumerate_init_pointers (Gum.FoundDarwinInitPointersFunc func);
 		public void enumerate_init_offsets (Gum.FoundDarwinInitOffsetsFunc func);
 		public void enumerate_term_pointers (Gum.FoundDarwinTermPointersFunc func);
-		public void enumerate_dependencies (Gum.FoundDarwinDependencyFunc func);
+		public void enumerate_dependencies (Gum.FoundDependencyFunc func);
 		public unowned string? get_dependency_by_ordinal (int ordinal);
 	}
 
@@ -739,7 +1795,6 @@ namespace Gum {
 	public delegate bool FoundDarwinInitPointersFunc (Gum.DarwinInitPointersDetails details);
 	public delegate bool FoundDarwinInitOffsetsFunc (Gum.DarwinInitOffsetsDetails details);
 	public delegate bool FoundDarwinTermPointersFunc (Gum.DarwinTermPointersDetails details);
-	public delegate bool FoundDarwinDependencyFunc (string path);
 
 	[Compact]
 	public class DarwinModuleImage {
@@ -919,5 +1974,520 @@ namespace Gum {
 
 	[CCode (has_type_id = false)]
 	public struct DarwinPageProtection : int {
+	}
+
+	[Compact]
+	[CCode (cheader_filename = "gum/arch-arm64/gumarm64writer.h", ref_function = "gum_arm64_writer_ref", unref_function = "gum_arm64_writer_unref", has_type_id = false)]
+	public class Arm64Writer {
+		public int ref_count;
+		public bool flush_on_destroy;
+
+		public Gum.OS target_os;
+		public Gum.PtrauthSupport ptrauth_support;
+		[CCode (cname = "sign")]
+		public Gum.PtrauthSignFunc sign_impl;
+
+		public uint32 * base;
+		public uint32 * code;
+		public Gum.Address pc;
+
+		public Arm64Writer (void * code_address);
+
+		public void reset (void * code_address);
+
+		public void * cur ();
+		public uint offset ();
+		public void skip (uint n_bytes);
+
+		public bool flush ();
+
+		public bool put_label (void * id);
+
+		public void put_call_address_with_arguments (Gum.Address func, uint n_args, ...);
+		public void put_call_address_with_arguments_array (Gum.Address func, [CCode (array_length_pos = 1.1, array_length_type = "guint")] Gum.Argument[] args);
+		public void put_call_reg_with_arguments (Gum.Arm64Reg reg, uint n_args, ...);
+		public void put_call_reg_with_arguments_array (Gum.Arm64Reg reg, [CCode (array_length_pos = 1.1, array_length_type = "guint")] Gum.Argument[] args);
+
+		public void put_branch_address (Gum.Address address);
+
+		public bool can_branch_directly_between (Gum.Address from, Gum.Address to);
+		public bool put_b_imm (Gum.Address address);
+		public void put_b_label (void * label_id);
+		public void put_b_cond_label (Gum.Arm64ConditionCode cc, void * label_id);
+		public bool put_bl_imm (Gum.Address address);
+		public void put_bl_label (void * label_id);
+		public bool put_br_reg (Gum.Arm64Reg reg);
+		public bool put_br_reg_no_auth (Gum.Arm64Reg reg);
+		public bool put_blr_reg (Gum.Arm64Reg reg);
+		public bool put_blr_reg_no_auth (Gum.Arm64Reg reg);
+		public void put_ret ();
+		public bool put_ret_reg (Gum.Arm64Reg reg);
+		public bool put_cbz_reg_imm (Gum.Arm64Reg reg, Gum.Address target);
+		public bool put_cbnz_reg_imm (Gum.Arm64Reg reg, Gum.Address target);
+		public void put_cbz_reg_label (Gum.Arm64Reg reg, void * label_id);
+		public void put_cbnz_reg_label (Gum.Arm64Reg reg, void * label_id);
+		public bool put_tbz_reg_imm_imm (Gum.Arm64Reg reg, uint bit, Gum.Address target);
+		public bool put_tbnz_reg_imm_imm (Gum.Arm64Reg reg, uint bit, Gum.Address target);
+		public void put_tbz_reg_imm_label (Gum.Arm64Reg reg, uint bit, void * label_id);
+		public void put_tbnz_reg_imm_label (Gum.Arm64Reg reg, uint bit, void * label_id);
+
+		public bool put_push_reg_reg (Gum.Arm64Reg reg_a, Gum.Arm64Reg reg_b);
+		public bool put_pop_reg_reg (Gum.Arm64Reg reg_a, Gum.Arm64Reg reg_b);
+		public void put_push_all_x_registers ();
+		public void put_pop_all_x_registers ();
+		public void put_push_all_q_registers ();
+		public void put_pop_all_q_registers ();
+
+		public bool put_ldr_reg_address (Gum.Arm64Reg reg, Gum.Address address);
+		public bool put_ldr_reg_u32 (Gum.Arm64Reg reg, uint32 val);
+		public bool put_ldr_reg_u64 (Gum.Arm64Reg reg, uint64 val);
+		public bool put_ldr_reg_u32_ptr (Gum.Arm64Reg reg, Gum.Address src_address);
+		public bool put_ldr_reg_u64_ptr (Gum.Arm64Reg reg, Gum.Address src_address);
+		public uint put_ldr_reg_ref (Gum.Arm64Reg reg);
+		public void put_ldr_reg_value (uint ref, Gum.Address value);
+		public bool put_ldr_reg_reg (Gum.Arm64Reg dst_reg, Gum.Arm64Reg src_reg);
+		public bool put_ldr_reg_reg_offset (Gum.Arm64Reg dst_reg, Gum.Arm64Reg src_reg, size_t src_offset);
+		public bool put_ldr_reg_reg_offset_mode (Gum.Arm64Reg dst_reg, Gum.Arm64Reg src_reg, ssize_t src_offset, Gum.Arm64IndexMode mode);
+		public bool put_ldrsw_reg_reg_offset (Gum.Arm64Reg dst_reg, Gum.Arm64Reg src_reg, size_t src_offset);
+		public bool put_adrp_reg_address (Gum.Arm64Reg reg, Gum.Address address);
+		public bool put_str_reg_reg (Gum.Arm64Reg src_reg, Gum.Arm64Reg dst_reg);
+		public bool put_str_reg_reg_offset (Gum.Arm64Reg src_reg, Gum.Arm64Reg dst_reg, size_t dst_offset);
+		public bool put_str_reg_reg_offset_mode (Gum.Arm64Reg src_reg, Gum.Arm64Reg dst_reg, ssize_t dst_offset, Gum.Arm64IndexMode mode);
+		public bool put_ldp_reg_reg_reg_offset (Gum.Arm64Reg reg_a, Gum.Arm64Reg reg_b, Gum.Arm64Reg reg_src, ssize_t src_offset, Gum.Arm64IndexMode mode);
+		public bool put_stp_reg_reg_reg_offset (Gum.Arm64Reg reg_a, Gum.Arm64Reg reg_b, Gum.Arm64Reg reg_dst, ssize_t dst_offset, Gum.Arm64IndexMode mode);
+		public bool put_mov_reg_reg (Gum.Arm64Reg dst_reg, Gum.Arm64Reg src_reg);
+		public void put_mov_reg_nzcv (Gum.Arm64Reg reg);
+		public void put_mov_nzcv_reg (Gum.Arm64Reg reg);
+		public bool put_uxtw_reg_reg (Gum.Arm64Reg dst_reg, Gum.Arm64Reg src_reg);
+		public bool put_add_reg_reg_imm (Gum.Arm64Reg dst_reg, Gum.Arm64Reg left_reg, size_t right_value);
+		public bool put_add_reg_reg_reg (Gum.Arm64Reg dst_reg, Gum.Arm64Reg left_reg, Gum.Arm64Reg right_reg);
+		public bool put_sub_reg_reg_imm (Gum.Arm64Reg dst_reg, Gum.Arm64Reg left_reg, size_t right_value);
+		public bool put_sub_reg_reg_reg (Gum.Arm64Reg dst_reg, Gum.Arm64Reg left_reg, Gum.Arm64Reg right_reg);
+		public bool put_and_reg_reg_imm (Gum.Arm64Reg dst_reg, Gum.Arm64Reg left_reg, uint64 right_value);
+		public bool put_tst_reg_imm (Gum.Arm64Reg reg, uint64 imm_value);
+		public bool put_cmp_reg_reg (Gum.Arm64Reg reg_a, Gum.Arm64Reg reg_b);
+
+		public bool put_xpaci_reg (Gum.Arm64Reg reg);
+
+		public void put_nop ();
+		public void put_brk_imm (uint16 imm);
+
+		public void put_instruction (uint32 insn);
+		public bool put_bytes ([CCode (array_length_type = "guint")] uint8[] data);
+
+		public Gum.Address sign (Gum.Address value);
+	}
+
+	[Compact]
+	[CCode (cheader_filename = "gum/arch-arm64/gumarm64relocator.h", ref_function = "gum_arm64_relocator_ref", unref_function = "gum_arm64_relocator_unref", has_type_id = false)]
+	public class Arm64Relocator {
+		public int ref_count;
+
+		public void * capstone;
+
+		public uint8 * input_start;
+		public uint8 * input_cur;
+		public Gum.Address input_pc;
+		public void ** input_insns;
+		public Gum.Arm64Writer output;
+
+		public uint inpos;
+		public uint outpos;
+
+		public bool eob;
+		public bool eoi;
+
+		public Arm64Relocator (void * input_code, Gum.Arm64Writer output);
+
+		public void reset (void * input_code, Gum.Arm64Writer output);
+
+		public uint read_one (out void * instruction = null);
+
+		public void * peek_next_write_insn ();
+		public void * peek_next_write_source ();
+		public void skip_one ();
+		public bool write_one ();
+		public void write_all ();
+
+		public static bool can_relocate (void * address, uint min_bytes, Gum.RelocationScenario scenario, out uint maximum = null, out Gum.Arm64Reg available_scratch_reg = null);
+		public static uint relocate (void * from, uint min_bytes, void * to);
+	}
+
+	[CCode (cname = "arm64_reg", cprefix = "ARM64_REG_")]
+	public enum Arm64Reg {
+		INVALID,
+		FFR,
+		FP,
+		LR,
+		NZCV,
+		SP,
+		VG,
+		WSP,
+		WZR,
+		XZR,
+		ZA,
+		B0,
+		B1,
+		B2,
+		B3,
+		B4,
+		B5,
+		B6,
+		B7,
+		B8,
+		B9,
+		B10,
+		B11,
+		B12,
+		B13,
+		B14,
+		B15,
+		B16,
+		B17,
+		B18,
+		B19,
+		B20,
+		B21,
+		B22,
+		B23,
+		B24,
+		B25,
+		B26,
+		B27,
+		B28,
+		B29,
+		B30,
+		B31,
+		D0,
+		D1,
+		D2,
+		D3,
+		D4,
+		D5,
+		D6,
+		D7,
+		D8,
+		D9,
+		D10,
+		D11,
+		D12,
+		D13,
+		D14,
+		D15,
+		D16,
+		D17,
+		D18,
+		D19,
+		D20,
+		D21,
+		D22,
+		D23,
+		D24,
+		D25,
+		D26,
+		D27,
+		D28,
+		D29,
+		D30,
+		D31,
+		H0,
+		H1,
+		H2,
+		H3,
+		H4,
+		H5,
+		H6,
+		H7,
+		H8,
+		H9,
+		H10,
+		H11,
+		H12,
+		H13,
+		H14,
+		H15,
+		H16,
+		H17,
+		H18,
+		H19,
+		H20,
+		H21,
+		H22,
+		H23,
+		H24,
+		H25,
+		H26,
+		H27,
+		H28,
+		H29,
+		H30,
+		H31,
+		P0,
+		P1,
+		P2,
+		P3,
+		P4,
+		P5,
+		P6,
+		P7,
+		P8,
+		P9,
+		P10,
+		P11,
+		P12,
+		P13,
+		P14,
+		P15,
+		Q0,
+		Q1,
+		Q2,
+		Q3,
+		Q4,
+		Q5,
+		Q6,
+		Q7,
+		Q8,
+		Q9,
+		Q10,
+		Q11,
+		Q12,
+		Q13,
+		Q14,
+		Q15,
+		Q16,
+		Q17,
+		Q18,
+		Q19,
+		Q20,
+		Q21,
+		Q22,
+		Q23,
+		Q24,
+		Q25,
+		Q26,
+		Q27,
+		Q28,
+		Q29,
+		Q30,
+		Q31,
+		S0,
+		S1,
+		S2,
+		S3,
+		S4,
+		S5,
+		S6,
+		S7,
+		S8,
+		S9,
+		S10,
+		S11,
+		S12,
+		S13,
+		S14,
+		S15,
+		S16,
+		S17,
+		S18,
+		S19,
+		S20,
+		S21,
+		S22,
+		S23,
+		S24,
+		S25,
+		S26,
+		S27,
+		S28,
+		S29,
+		S30,
+		S31,
+		W0,
+		W1,
+		W2,
+		W3,
+		W4,
+		W5,
+		W6,
+		W7,
+		W8,
+		W9,
+		W10,
+		W11,
+		W12,
+		W13,
+		W14,
+		W15,
+		W16,
+		W17,
+		W18,
+		W19,
+		W20,
+		W21,
+		W22,
+		W23,
+		W24,
+		W25,
+		W26,
+		W27,
+		W28,
+		W29,
+		W30,
+		X0,
+		X1,
+		X2,
+		X3,
+		X4,
+		X5,
+		X6,
+		X7,
+		X8,
+		X9,
+		X10,
+		X11,
+		X12,
+		X13,
+		X14,
+		X15,
+		X16,
+		X17,
+		X18,
+		X19,
+		X20,
+		X21,
+		X22,
+		X23,
+		X24,
+		X25,
+		X26,
+		X27,
+		X28,
+		Z0,
+		Z1,
+		Z2,
+		Z3,
+		Z4,
+		Z5,
+		Z6,
+		Z7,
+		Z8,
+		Z9,
+		Z10,
+		Z11,
+		Z12,
+		Z13,
+		Z14,
+		Z15,
+		Z16,
+		Z17,
+		Z18,
+		Z19,
+		Z20,
+		Z21,
+		Z22,
+		Z23,
+		Z24,
+		Z25,
+		Z26,
+		Z27,
+		Z28,
+		Z29,
+		Z30,
+		Z31,
+		ZAB0,
+		ZAD0,
+		ZAD1,
+		ZAD2,
+		ZAD3,
+		ZAD4,
+		ZAD5,
+		ZAD6,
+		ZAD7,
+		ZAH0,
+		ZAH1,
+		ZAQ0,
+		ZAQ1,
+		ZAQ2,
+		ZAQ3,
+		ZAQ4,
+		ZAQ5,
+		ZAQ6,
+		ZAQ7,
+		ZAQ8,
+		ZAQ9,
+		ZAQ10,
+		ZAQ11,
+		ZAQ12,
+		ZAQ13,
+		ZAQ14,
+		ZAQ15,
+		ZAS0,
+		ZAS1,
+		ZAS2,
+		ZAS3,
+		V0,
+		V1,
+		V2,
+		V3,
+		V4,
+		V5,
+		V6,
+		V7,
+		V8,
+		V9,
+		V10,
+		V11,
+		V12,
+		V13,
+		V14,
+		V15,
+		V16,
+		V17,
+		V18,
+		V19,
+		V20,
+		V21,
+		V22,
+		V23,
+		V24,
+		V25,
+		V26,
+		V27,
+		V28,
+		V29,
+		V30,
+		V31,
+		IP0,
+		IP1,
+		X29,
+		X30,
+	}
+
+	[CCode (cname = "arm64_cc", cprefix = "ARM64_CC_")]
+	public enum Arm64ConditionCode {
+		INVALID,
+		EQ,
+		NE,
+		HS,
+		LO,
+		MI,
+		PL,
+		VS,
+		VC,
+		HI,
+		LS,
+		GE,
+		LT,
+		GT,
+		LE,
+		AL,
+		NV,
+	}
+
+	[CCode (cprefix = "GUM_INDEX_")]
+	public enum Arm64IndexMode {
+		POST_ADJUST,
+		SIGNED_OFFSET,
+		PRE_ADJUST,
 	}
 }

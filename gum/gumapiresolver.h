@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2016-2023 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -11,16 +11,16 @@
 
 G_BEGIN_DECLS
 
+#define GUM_API_SIZE_NONE -1
+
 #define GUM_TYPE_API_RESOLVER (gum_api_resolver_get_type ())
-GUM_DECLARE_INTERFACE (GumApiResolver, gum_api_resolver, GUM, API_RESOLVER,
-                       GObject)
+G_DECLARE_INTERFACE (GumApiResolver, gum_api_resolver, GUM, API_RESOLVER,
+                     GObject)
 
 typedef struct _GumApiDetails GumApiDetails;
 
 typedef gboolean (* GumFoundApiFunc) (const GumApiDetails * details,
     gpointer user_data);
-
-#ifndef GUM_DIET
 
 struct _GumApiResolverInterface
 {
@@ -30,12 +30,11 @@ struct _GumApiResolverInterface
       GumFoundApiFunc func, gpointer user_data, GError ** error);
 };
 
-#endif
-
 struct _GumApiDetails
 {
   const gchar * name;
   GumAddress address;
+  gssize size;
 };
 
 GUM_API GumApiResolver * gum_api_resolver_make (const gchar * type);

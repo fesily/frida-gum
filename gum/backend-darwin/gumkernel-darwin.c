@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2015-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2015-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2023 Alex Soler <asoler@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
@@ -8,9 +8,9 @@
 #include "gumkernel.h"
 
 #include "gum-init.h"
-#include "gumdarwin.h"
+#include "gum/gumdarwin.h"
+#include "gumdarwin-priv.h"
 #include "gummemory-priv.h"
-#include "gumprocess-darwin-priv.h"
 
 #include <mach/mach.h>
 #include <mach-o/loader.h>
@@ -66,7 +66,7 @@ struct _GumKernelFindRangeByNameContext
 
 struct _GumEmitModuleContext
 {
-  GumFoundModuleFunc func;
+  GumFoundKernelModuleFunc func;
   gpointer user_data;
 };
 
@@ -377,7 +377,7 @@ gum_kernel_emit_match (GumAddress address,
 }
 
 void
-gum_kernel_enumerate_modules (GumFoundModuleFunc func,
+gum_kernel_enumerate_modules (GumFoundKernelModuleFunc func,
                               gpointer user_data)
 {
   GumEmitModuleContext ctx;
@@ -396,7 +396,7 @@ gum_kernel_emit_module (GumDarwinModule * module,
                         gpointer user_data)
 {
   GumEmitModuleContext * ctx = user_data;
-  GumModuleDetails details;
+  GumKernelModuleDetails details;
   GumMemoryRange range;
 
   range.base_address = module->base_address;
@@ -569,7 +569,7 @@ gum_kernel_store_kext_name (GumAddress address,
 
   /* Reference: osfmk/mach/kmod.h */
   buf = gum_kernel_read (address + 0x8c, 8, NULL);
-  kext = g_hash_table_lookup (ctx->kexts, *((GumAddress**)buf));
+  kext = g_hash_table_lookup (ctx->kexts, *((GumAddress **) buf));
   g_free (buf);
 
   if (kext == NULL)
@@ -634,7 +634,6 @@ gum_kernel_kext_by_name (GumDarwinModule * module,
 
   return !ctx->found;
 }
-
 
 static gboolean
 gum_kernel_emit_module_range (const GumDarwinSectionDetails * section,
@@ -907,7 +906,7 @@ gum_kernel_get_task (void)
 static mach_port_t
 gum_kernel_do_init (void)
 {
-#ifdef HAVE_IOS
+#if defined (HAVE_IOS) || defined (HAVE_TVOS)
   mach_port_t task;
 
   if (gum_darwin_query_hardened ())

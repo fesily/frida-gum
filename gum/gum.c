@@ -1,5 +1,7 @@
 /*
- * Copyright (C) 2008-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2008-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2023 Stefano Moioli <smxdev4@gmail.com>
+ * Copyright (C) 2024 Yannis Juglaret <yjuglaret@mozilla.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -20,7 +22,7 @@
 #  include <cpuid.h>
 # endif
 #elif defined (HAVE_ARM64) && defined (HAVE_DARWIN)
-# include "backend-darwin/gumdarwin.h"
+# include "gum/gumdarwin.h"
 #endif
 
 #include <stdarg.h>
@@ -108,10 +110,8 @@ struct _GumCFApi
 
 static void gum_do_init (void);
 
-#ifndef GUM_DIET
 static GumAddress * gum_address_copy (const GumAddress * address);
 static void gum_address_free (GumAddress * address);
-#endif
 
 static GumCpuFeatures gum_do_query_cpu_features (void);
 
@@ -128,8 +128,8 @@ static GumInterceptor * gum_cached_interceptor = NULL;
 
 G_DEFINE_QUARK (gum-error-quark, gum_error)
 
-GUM_DEFINE_BOXED_TYPE (GumAddress, gum_address, gum_address_copy,
-                       gum_address_free)
+G_DEFINE_BOXED_TYPE (GumAddress, gum_address, gum_address_copy,
+                     gum_address_free)
 
 void
 gum_init (void)
@@ -183,9 +183,7 @@ gum_do_init (void)
 
 #ifdef HAVE_FRIDA_GLIB
   glib_init ();
-# ifndef GUM_DIET
   gobject_init ();
-# endif
 #endif
 
 #ifndef GUM_USE_SYSTEM_ALLOC
@@ -323,7 +321,7 @@ gum_deinit_embedded (void)
   glib_shutdown ();
 #endif
 
-  gum_clear_object (&gum_cached_interceptor);
+  g_clear_object (&gum_cached_interceptor);
 
   gum_deinit ();
 #ifdef HAVE_FRIDA_GLIB
@@ -510,36 +508,44 @@ gum_on_log_message (const gchar * log_domain,
   {
     const gchar * cf_path = "/System/Library/Frameworks/"
         "CoreFoundation.framework/CoreFoundation";
-    void * cf;
+    GumModule * cf;
 
     /*
      * CoreFoundation must be loaded by the main thread, so we should avoid
      * loading it.
      */
-    if (gum_module_find_base_address (cf_path) != 0)
+    cf = gum_process_find_module_by_name (cf_path);
+    if (cf != NULL)
     {
-      cf = dlopen (cf_path, RTLD_GLOBAL | RTLD_LAZY);
-      g_assert (cf != NULL);
+      GumModule * foundation;
 
       api = g_slice_new (GumCFApi);
 
-      api->CFStringCreateWithCString = dlsym (cf, "CFStringCreateWithCString");
+      api->CFStringCreateWithCString = GSIZE_TO_POINTER (
+          gum_module_find_export_by_name (cf, "CFStringCreateWithCString"));
       g_assert (api->CFStringCreateWithCString != NULL);
 
-      api->CFRelease = dlsym (cf, "CFRelease");
+      api->CFRelease = GSIZE_TO_POINTER (
+          gum_module_find_export_by_name (cf, "CFRelease"));
       g_assert (api->CFRelease != NULL);
 
-      api->CFLog = dlsym (cf, "CFLog");
+      api->CFLog = GSIZE_TO_POINTER (
+          gum_module_find_export_by_name (cf, "CFLog"));
       g_assert (api->CFLog != NULL);
 
-      dlclose (cf);
+      g_object_unref (cf);
 
       /*
        * In case Foundation is also loaded, make sure it's initialized
        * so CFLog() doesn't crash if called early.
        */
-      gum_module_ensure_initialized ("/System/Library/Frameworks/"
-          "Foundation.framework/Foundation");
+      foundation = gum_process_find_module_by_name (
+          "/System/Library/Frameworks/Foundation.framework/Foundation");
+      if (foundation != NULL)
+      {
+        gum_module_ensure_initialized (foundation);
+        g_object_unref (foundation);
+      }
     }
     else
     {
@@ -644,49 +650,18 @@ gum_on_log_message (const gchar * log_domain,
 #endif
 }
 
-#ifdef GUM_DIET
-
-gpointer
-gum_object_ref (gpointer object)
-{
-  GumObject * self = object;
-
-  g_atomic_int_inc (&self->ref_count);
-
-  return self;
-}
-
-void
-gum_object_unref (gpointer object)
-{
-  GumObject * self = object;
-
-  if (g_atomic_int_dec_and_test (&self->ref_count))
-  {
-    self->finalize (object);
-
-    g_free (self);
-  }
-}
-
-#endif
-
 void
 gum_panic (const gchar * format,
            ...)
 {
-#ifndef GUM_DIET
   va_list args;
 
   va_start (args, format);
   g_logv (G_LOG_DOMAIN, G_LOG_LEVEL_CRITICAL, format, args);
   va_end (args);
-#endif
 
   g_abort ();
 }
-
-#ifndef GUM_DIET
 
 static GumAddress *
 gum_address_copy (const GumAddress * address)
@@ -699,8 +674,6 @@ gum_address_free (GumAddress * address)
 {
   g_slice_free (GumAddress, address);
 }
-
-#endif
 
 GumCpuFeatures
 gum_query_cpu_features (void)
@@ -719,7 +692,6 @@ gum_query_cpu_features (void)
 
 #if defined (HAVE_I386)
 
-static gboolean gum_query_noxsave (void);
 static gboolean gum_get_cpuid (guint level, guint * a, guint * b, guint * c,
     guint * d);
 
@@ -727,51 +699,27 @@ static GumCpuFeatures
 gum_do_query_cpu_features (void)
 {
   GumCpuFeatures features = 0;
+  gboolean cpu_supports_avx2 = FALSE;
+  gboolean cpu_supports_cet_ss = FALSE;
+  gboolean os_enabled_xsave = FALSE;
   guint a, b, c, d;
-
-  if (gum_query_noxsave ())
-    return features;
 
   if (gum_get_cpuid (7, &a, &b, &c, &d))
   {
-    if ((b & (1 << 5)) != 0)
-      features |= GUM_CPU_AVX2;
+    cpu_supports_avx2 = (b & (1 << 5)) != 0;
+    cpu_supports_cet_ss = (c & (1 << 7)) != 0;
   }
+
+  if (gum_get_cpuid (1, &a, &b, &c, &d))
+    os_enabled_xsave = (c & (1 << 27)) != 0;
+
+  if (cpu_supports_avx2 && os_enabled_xsave)
+    features |= GUM_CPU_AVX2;
+
+  if (cpu_supports_cet_ss)
+    features |= GUM_CPU_CET_SS;
 
   return features;
-}
-
-static gboolean
-gum_query_noxsave (void)
-{
-  gboolean noxsave = FALSE;
-
-#ifdef HAVE_LINUX
-  gchar * cmdline = NULL;
-  gchar ** params = NULL;
-  gint num_params, i;
-
-  if (!g_file_get_contents ("/proc/cmdline", &cmdline, NULL, NULL))
-    goto beach;
-
-  if (!g_shell_parse_argv (cmdline, &num_params, &params, NULL))
-    goto beach;
-
-  for (i = 0; i != num_params; i++)
-  {
-    if (strcmp (params[i], "noxsave") == 0)
-    {
-      noxsave = TRUE;
-      break;
-    }
-  }
-
-beach:
-  g_strfreev (params);
-  g_free (cmdline);
-#endif
-
-  return noxsave;
 }
 
 static gboolean

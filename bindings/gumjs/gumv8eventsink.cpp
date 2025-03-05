@@ -1,5 +1,7 @@
 /*
- * Copyright (C) 2012-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2012-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2024 Alex Soler <asoler@nowsecure.com>
+ * Copyright (C) 2024 Francesco Tamagni <mrmacete@protonmail.ch>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -226,7 +228,12 @@ gum_v8_js_event_sink_process (GumEventSink * sink,
 static void
 gum_v8_js_event_sink_flush (GumEventSink * sink)
 {
-  gum_v8_js_event_sink_drain (GUM_V8_JS_EVENT_SINK (sink));
+  auto self = GUM_V8_JS_EVENT_SINK (sink);
+
+  if (self->core == NULL)
+    return;
+
+  gum_v8_js_event_sink_drain (self);
 }
 
 static void
@@ -284,7 +291,7 @@ gum_v8_js_event_sink_drain (GumV8JSEventSink * self)
   size = len * sizeof (GumEvent);
   if (len != 0)
   {
-    buffer = g_memdup (self->queue->data, size);
+    buffer = g_memdup2 (self->queue->data, size);
 
     gum_spinlock_acquire (&self->lock);
     g_array_remove_range (self->queue, 0, len);

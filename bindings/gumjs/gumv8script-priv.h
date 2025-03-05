@@ -1,5 +1,6 @@
 /*
- * Copyright (C) 2015-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2015-2025 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2024 Håvard Sørbø <havard@hsorbo.no>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -9,6 +10,7 @@
 
 #include "gumv8apiresolver.h"
 #include "gumv8checksum.h"
+#include "gumv8cloak.h"
 #include "gumv8cmodule.h"
 #include "gumv8coderelocator.h"
 #include "gumv8codewriter.h"
@@ -21,6 +23,8 @@
 #include "gumv8module.h"
 #include "gumv8platform.h"
 #include "gumv8process.h"
+#include "gumv8profiler.h"
+#include "gumv8sampler.h"
 #include "gumv8scope.h"
 #include "gumv8script.h"
 #include "gumv8scriptbackend.h"
@@ -78,8 +82,8 @@ struct _GumV8Script
   GumV8Kernel kernel;
   GumV8Memory memory;
   GumV8Module module;
-  GumV8Process process;
   GumV8Thread thread;
+  GumV8Process process;
   GumV8File file;
   GumV8Checksum checksum;
   GumV8Stream stream;
@@ -95,6 +99,10 @@ struct _GumV8Script
   GumV8CodeWriter code_writer;
   GumV8CodeRelocator code_relocator;
   GumV8Stalker stalker;
+  GumV8Cloak cloak;
+  GumV8Sampler sampler;
+  GumV8Profiler profiler;
+
   v8::Global<v8::Context> * context;
   GumESProgram * program;
 

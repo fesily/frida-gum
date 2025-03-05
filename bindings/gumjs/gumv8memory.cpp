@@ -1,6 +1,8 @@
 /*
- * Copyright (C) 2010-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2010-2025 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2021 Abdelrahman Eid <hot3eed@gmail.com>
+ * Copyright (C) 2023 Håvard Sørbø <havard@hsorbo.no>
+ * Copyright (C) 2025 Kenjiro Ichise <ichise@doranekosystems.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -74,6 +76,7 @@ struct GumMemoryScanSyncContext
 GUMJS_DECLARE_FUNCTION (gumjs_memory_alloc)
 GUMJS_DECLARE_FUNCTION (gumjs_memory_copy)
 GUMJS_DECLARE_FUNCTION (gumjs_memory_protect)
+GUMJS_DECLARE_FUNCTION (gumjs_memory_query_protection)
 GUMJS_DECLARE_FUNCTION (gumjs_memory_patch_code)
 static void gum_memory_patch_context_apply (gpointer mem,
     GumMemoryPatchContext * self);
@@ -83,6 +86,8 @@ static void gum_v8_memory_read (GumMemoryValueType type,
     const GumV8Args * args, ReturnValue<Value> return_value);
 static void gum_v8_memory_write (GumMemoryValueType type,
     const GumV8Args * args);
+GUMJS_DECLARE_FUNCTION (gum_v8_memory_read_volatile)
+GUMJS_DECLARE_FUNCTION (gum_v8_memory_write_volatile)
 
 #ifdef HAVE_WINDOWS
 static gchar * gum_ansi_string_to_utf8 (const gchar * str_ansi, gint length);
@@ -154,6 +159,7 @@ static const GumV8Function gumjs_memory_functions[] =
   { "_alloc", gumjs_memory_alloc },
   { "copy", gumjs_memory_copy },
   { "protect", gumjs_memory_protect },
+  { "queryProtection", gumjs_memory_query_protection },
   { "_patchCode", gumjs_memory_patch_code },
   { "_checkCodePointer", gumjs_memory_check_code_pointer },
 
@@ -179,6 +185,8 @@ static const GumV8Function gumjs_memory_functions[] =
   GUMJS_EXPORT_MEMORY_READ_WRITE ("Utf8String", UTF8_STRING),
   GUMJS_EXPORT_MEMORY_READ_WRITE ("Utf16String", UTF16_STRING),
   GUMJS_EXPORT_MEMORY_READ_WRITE ("AnsiString", ANSI_STRING),
+  { "readVolatile", gum_v8_memory_read_volatile },
+  { "writeVolatile", gum_v8_memory_write_volatile },
 
   { "allocAnsiString", gumjs_memory_alloc_ansi_string },
   { "allocUtf8String", gumjs_memory_alloc_utf8_string },
@@ -344,6 +352,23 @@ GUMJS_DEFINE_FUNCTION (gumjs_memory_protect)
     success = true;
 
   info.GetReturnValue ().Set (success);
+}
+
+GUMJS_DEFINE_FUNCTION (gumjs_memory_query_protection)
+{
+  gpointer address;
+  GumPageProtection prot;
+
+  if (!_gum_v8_args_parse (args, "p", &address))
+    return;
+
+  if (!gum_memory_query_protection (address, &prot))
+  {
+    _gum_v8_throw_ascii_literal (isolate, "failed to query address");
+    return;
+  }
+
+  info.GetReturnValue ().Set (_gum_v8_page_protection_new (isolate,  prot));
 }
 
 GUMJS_DEFINE_FUNCTION (gumjs_memory_patch_code)
@@ -645,6 +670,42 @@ gum_v8_memory_read (GumMemoryValueType type,
     if (!result.IsEmpty ())
       return_value.Set (result);
   }
+}
+
+GUMJS_DEFINE_FUNCTION (gum_v8_memory_read_volatile)
+{
+  gpointer address;
+  gsize length;
+  if (!_gum_v8_args_parse (args, "pz", &address, &length))
+    return;
+
+  gsize n_bytes_read;
+  guint8 * data = gum_memory_read (address, length, &n_bytes_read);
+  if (data == NULL)
+  {
+    _gum_v8_throw_ascii_literal (isolate, "memory read failed");
+    return;
+  }
+
+  Local<Value> result = ArrayBuffer::New (isolate, n_bytes_read);
+  memcpy (result.As<ArrayBuffer> ()->GetBackingStore ()->Data (), data, length);
+  info.GetReturnValue ().Set (result);
+
+  g_free (data);
+}
+
+GUMJS_DEFINE_FUNCTION (gum_v8_memory_write_volatile)
+{
+  gpointer address;
+  GBytes * bytes;
+  if (!_gum_v8_args_parse (args, "pB", &address, &bytes))
+    return;
+
+  gsize size;
+  auto data = g_bytes_get_data (bytes, &size);
+
+  if (!gum_memory_write (address, (const guint8 *) data, size))
+    _gum_v8_throw_ascii_literal (isolate, "memory write failed");
 }
 
 static void
@@ -1164,6 +1225,8 @@ gum_v8_memory_on_access (GumMemoryAccessMonitor * monitor,
   ScriptScope script_scope (core->script);
 
   auto d = Object::New (isolate);
+  _gum_v8_object_set (d, "threadId", Number::New (isolate, details->thread_id),
+      core);
   _gum_v8_object_set_ascii (d, "operation",
       _gum_v8_memory_operation_to_string (details->operation), core);
   _gum_v8_object_set_pointer (d, "from", details->from, core);
@@ -1174,9 +1237,14 @@ gum_v8_memory_on_access (GumMemoryAccessMonitor * monitor,
   _gum_v8_object_set_uint (d, "pagesCompleted", details->pages_completed, core);
   _gum_v8_object_set_uint (d, "pagesTotal", details->pages_total, core);
 
+  auto context = _gum_v8_cpu_context_new_mutable (details->context, core);
+  _gum_v8_object_set (d, "context", context, core);
+
   auto on_access (Local<Function>::New (isolate, *self->on_access));
   Local<Value> argv[] = { d };
   auto result = on_access->Call (isolate->GetCurrentContext (),
       Undefined (isolate), G_N_ELEMENTS (argv), argv);
   (void) result;
+
+  _gum_v8_cpu_context_free_later (new Global<Object> (isolate, context), core);
 }

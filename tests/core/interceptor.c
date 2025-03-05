@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2008-2025 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2008 Christian Berentsen <jc.berentsen@gmail.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
@@ -96,7 +96,7 @@ TESTCASE (attach_two)
   g_assert_cmpstr (fixture->result->str, ==, "ac|bd");
 }
 
-void GUM_NOINLINE
+GUM_HOOK_TARGET static void
 recursive_function (GString * str,
                     gint count)
 {
@@ -129,7 +129,7 @@ TESTCASE (attach_to_pthread_key_create)
   pthread_key_t key;
 
   pthread_key_create_impl = GSIZE_TO_POINTER (
-      gum_module_find_export_by_name (NULL, "pthread_key_create"));
+      gum_module_find_global_export_by_name ("pthread_key_create"));
 
   interceptor_fixture_attach (fixture, 0, pthread_key_create_impl, '>', '<');
 

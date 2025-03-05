@@ -1,9 +1,9 @@
 runner_sources = [
   'gumtest.c',
   'testutil.c',
-  'stubs/dummyclasses.c',
-  'stubs/fakebacktracer.c',
-  'stubs/fakeeventsink.c',
+  'stubs' / 'dummyclasses.c',
+  'stubs' / 'fakebacktracer.c',
+  'stubs' / 'fakeeventsink.c',
   'stalkerdummychannel.c',
   'lowlevelhelpers.c',
 ]
@@ -67,16 +67,17 @@ if force_cpp_linking
 endif
 
 if host_os_family == 'windows'
-  extra_link_depends += configure_file(input: dbghelp_dll, output: 'dbghelp.dll', copy: true)
-  extra_link_depends += configure_file(input: symsrv_dll, output: 'symsrv.dll', copy: true)
+  fs = import('fs')
+  extra_link_depends += fs.copyfile(dbghelp_dll)
+  extra_link_depends += fs.copyfile(symsrv_dll)
 endif
 
 if host_os_family == 'darwin'
   symlist = 'gum-tests.symbols'
-  extra_link_args += ['-Wl,-exported_symbols_list,' + join_paths(meson.current_source_dir(), symlist)]
+  extra_link_args += ['-Wl,-exported_symbols_list,' + (meson.current_source_dir() / symlist)]
   extra_link_depends += [symlist]
 
-  subdir('stubs/objc')
+  subdir('stubs' / 'objc')
   link_targets += objcdummyclass
 elif host_os_family != 'windows'
   if host_os == 'android'
@@ -84,7 +85,7 @@ elif host_os_family != 'windows'
   else
     symscript = 'gum-tests.version'
   endif
-  extra_link_args += ['-Wl,--version-script,' + join_paths(meson.current_source_dir(), symscript)]
+  extra_link_args += ['-Wl,--version-script,' + (meson.current_source_dir() / symscript)]
   extra_link_depends += [symscript]
 endif
 
@@ -96,7 +97,7 @@ if host_os in ['ios', 'watchos', 'tvos']
   extra_link_args += ['-Wl,-framework,Foundation']
 endif
 
-runner = executable(runner_name, runner_sources + [test_data_stamp],
+raw_runner = executable(runner_name, runner_sources + [test_data_stamp],
   link_with: link_targets,
   dependencies: [gum_dep, gum_heap_dep, gum_prof_dep, tls_provider_dep, threads_dep] + extra_test_deps,
   link_args: extra_link_args,
@@ -105,9 +106,9 @@ runner = executable(runner_name, runner_sources + [test_data_stamp],
 )
 
 if host_os_family == 'darwin'
-  custom_target('gum-tests-signed',
+  runner = custom_target('gum-tests-signed',
     input: [
-      runner,
+      raw_runner,
       'gum-tests.xcent',
     ],
     output: 'gum-tests',
@@ -119,4 +120,11 @@ if host_os_family == 'darwin'
     ],
     build_by_default: true,
   )
+else
+  runner = raw_runner
 endif
+
+test('gum', python,
+  args: [files('run.py'), runner.full_path()],
+  timeout: 120,
+)

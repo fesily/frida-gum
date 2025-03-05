@@ -1,5 +1,7 @@
 /*
- * Copyright (C) 2020 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2020-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2024 Alex Soler <asoler@nowsecure.com>
+ * Copyright (C) 2024 Francesco Tamagni <mrmacete@protonmail.ch>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -8,6 +10,7 @@
 
 #include "gumquickvalue.h"
 
+#include <glib/gprintf.h>
 #include <gum/gumspinlock.h>
 #include <string.h>
 
@@ -222,7 +225,12 @@ gum_quick_js_event_sink_process (GumEventSink * sink,
 static void
 gum_quick_js_event_sink_flush (GumEventSink * sink)
 {
-  gum_quick_js_event_sink_drain (GUM_QUICK_JS_EVENT_SINK (sink));
+  GumQuickJSEventSink * self = GUM_QUICK_JS_EVENT_SINK (sink);
+
+  if (self->core == NULL)
+    return;
+
+  gum_quick_js_event_sink_drain (self);
 }
 
 static void
@@ -286,7 +294,7 @@ gum_quick_js_event_sink_drain (GumQuickJSEventSink * self)
     return TRUE;
   size = len * sizeof (GumEvent);
 
-  buffer_data = g_memdup (self->queue->data, size);
+  buffer_data = g_memdup2 (self->queue->data, size);
 
   gum_spinlock_acquire (&self->lock);
   g_array_remove_range (self->queue, 0, len);
@@ -299,6 +307,7 @@ gum_quick_js_event_sink_drain (GumQuickJSEventSink * self)
 
   if (!JS_IsNull (self->on_call_summary))
   {
+    JSValue callback;
     JSValue summary;
     GHashTable * frequencies;
     GumCallEvent * ev;
@@ -306,6 +315,8 @@ gum_quick_js_event_sink_drain (GumQuickJSEventSink * self)
     GHashTableIter iter;
     gpointer target, count;
     gchar target_str[32];
+
+    callback = JS_DupValue (ctx, self->on_call_summary);
 
     summary = JS_NewObject (ctx);
 
@@ -329,7 +340,7 @@ gum_quick_js_event_sink_drain (GumQuickJSEventSink * self)
     g_hash_table_iter_init (&iter, frequencies);
     while (g_hash_table_iter_next (&iter, &target, &count))
     {
-      sprintf (target_str, "0x%" G_GSIZE_MODIFIER "x",
+      g_sprintf (target_str, "0x%" G_GSIZE_MODIFIER "x",
           GPOINTER_TO_SIZE (target));
       JS_DefinePropertyValueStr (ctx, summary,
           target_str,
@@ -339,16 +350,19 @@ gum_quick_js_event_sink_drain (GumQuickJSEventSink * self)
 
     g_hash_table_unref (frequencies);
 
-    _gum_quick_scope_call_void (&scope, self->on_call_summary, JS_UNDEFINED,
-        1, &summary);
+    _gum_quick_scope_call_void (&scope, callback, JS_UNDEFINED, 1, &summary);
 
     JS_FreeValue (ctx, summary);
+    JS_FreeValue (ctx, callback);
   }
 
   if (!JS_IsNull (self->on_receive))
   {
-    _gum_quick_scope_call_void (&scope, self->on_receive, JS_UNDEFINED,
-        1, &buffer_val);
+    JSValue callback = JS_DupValue (ctx, self->on_receive);
+
+    _gum_quick_scope_call_void (&scope, callback, JS_UNDEFINED, 1, &buffer_val);
+
+    JS_FreeValue (ctx, callback);
   }
 
   JS_FreeValue (ctx, buffer_val);

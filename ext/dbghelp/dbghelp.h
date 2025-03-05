@@ -26,7 +26,9 @@ Revision History:
 
 #include <winapifamily.h>
 
+#ifdef _MSC_VER
 #pragma region Desktop Family or WER Package
+#endif
 #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP | WINAPI_PARTITION_PKG_WER)
 
 
@@ -3905,10 +3907,14 @@ RangeMapWrite(
 #include <poppack.h>
 
 
+#ifndef __MINGW32__
 #include <minidumpapiset.h>
+#endif
 
 
 #endif /* WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP | WINAPI_PARTITION_PKG_WER) */
+#ifdef _MSC_VER
 #pragma endregion
+#endif
 
 #endif // _DBGHELP_

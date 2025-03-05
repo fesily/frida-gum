@@ -1,11 +1,11 @@
 /*
- * Copyright (C) 2008-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2008-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2020 Matt Oh <oh.jeongwook@gmail.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
 
-#include "gumdbghelp.h"
+#include "gum/gumdbghelp.h"
 
 #include "gum-init.h"
 #include "gumprocess.h"
@@ -100,6 +100,9 @@ load_dbghelp (void)
   DWORD length G_GNUC_UNUSED;
   WCHAR path[MAX_PATH + 1] = { 0, };
   WCHAR * filename;
+
+  if (GetModuleHandleExW (0, L"dbghelp.dll", &mod))
+    return mod;
 
   success = GetModuleHandleExW (
       GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |

@@ -1,7 +1,9 @@
 /*
- * Copyright (C) 2014-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
- * Copyright (C)      2017 Antonio Ken Iannillo <ak.iannillo@gmail.com>
- * Copyright (C)      2019 Jon Wilson <jonwilson@zepler.net>
+ * Copyright (C) 2014-2023 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2017 Antonio Ken Iannillo <ak.iannillo@gmail.com>
+ * Copyright (C) 2019 Jon Wilson <jonwilson@zepler.net>
+ * Copyright (C) 2023 Håvard Sørbø <havard@hsorbo.no>
+ * Copyright (C) 2023 Fabian Freyer <fabian.freyer@physik.tu-berlin.de>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -211,6 +213,7 @@ gum_arm64_writer_init (GumArm64Writer * writer,
   writer->ref_count = 1;
   writer->flush_on_destroy = TRUE;
 
+  writer->data_endian = G_BYTE_ORDER;
   writer->target_os = gum_process_get_native_os ();
   writer->ptrauth_support = gum_query_ptrauth_support ();
   writer->sign = gum_sign_code_address;
@@ -670,6 +673,22 @@ void
 gum_arm64_writer_put_ret (GumArm64Writer * self)
 {
   gum_arm64_writer_put_instruction (self, 0xd65f0000 | (GUM_MREG_LR << 5));
+}
+
+gboolean
+gum_arm64_writer_put_ret_reg (GumArm64Writer * self,
+                              arm64_reg reg)
+{
+  GumArm64RegInfo ri;
+
+  gum_arm64_writer_describe_reg (self, reg, &ri);
+
+  if (ri.width != 64)
+    return FALSE;
+
+  gum_arm64_writer_put_instruction (self, 0xd65f0000 | (ri.index << 5));
+
+  return TRUE;
 }
 
 gboolean
@@ -1581,6 +1600,97 @@ gum_arm64_writer_put_and_reg_reg_imm (GumArm64Writer * self,
 }
 
 gboolean
+gum_arm64_writer_put_eor_reg_reg_reg (GumArm64Writer * self,
+                                      arm64_reg dst_reg,
+                                      arm64_reg left_reg,
+                                      arm64_reg right_reg)
+{
+  GumArm64RegInfo rd, rl, rr;
+
+  gum_arm64_writer_describe_reg (self, dst_reg, &rd);
+  gum_arm64_writer_describe_reg (self, left_reg, &rl);
+  gum_arm64_writer_describe_reg (self, right_reg, &rr);
+
+  if (rl.width != rd.width || rr.width != rd.width)
+    return FALSE;
+
+  gum_arm64_writer_put_instruction (self,
+      (rd.width == 64 ? 0x80000000 : 0x00000000) |
+      0x4a000000 |
+      (rr.index << 16) |
+      (rl.index << 5) |
+      rd.index);
+
+  return TRUE;
+}
+
+gboolean
+gum_arm64_writer_put_ubfm (GumArm64Writer * self,
+                           arm64_reg dst_reg,
+                           arm64_reg src_reg,
+                           guint8 immr,
+                           guint8 imms)
+{
+  GumArm64RegInfo rd, rn;
+
+  gum_arm64_writer_describe_reg (self, dst_reg, &rd);
+  gum_arm64_writer_describe_reg (self, src_reg, &rn);
+
+  if (rn.width != rd.width)
+    return FALSE;
+
+  if (((imms | immr) & 0xc0) != 0)
+    return FALSE;
+
+  gum_arm64_writer_put_instruction (self,
+      (rd.width == 64 ? 0x80400000 : 0x00000000) |
+      0x53000000 |
+      (immr << 16) |
+      (imms << 10) |
+      (rn.index << 5) |
+      rd.index);
+
+  return TRUE;
+}
+
+gboolean
+gum_arm64_writer_put_lsl_reg_imm (GumArm64Writer * self,
+                                  arm64_reg dst_reg,
+                                  arm64_reg src_reg,
+                                  guint8 shift)
+{
+  GumArm64RegInfo rd;
+
+  gum_arm64_writer_describe_reg (self, dst_reg, &rd);
+
+  if (rd.width == 32 && (shift & 0xe0) != 0)
+    return FALSE;
+
+  if (rd.width == 64 && (shift & 0xc0) != 0)
+    return FALSE;
+
+  return gum_arm64_writer_put_ubfm (self, dst_reg, src_reg,
+      -shift % rd.width, (rd.width - 1) - shift);
+}
+
+gboolean
+gum_arm64_writer_put_lsr_reg_imm (GumArm64Writer * self,
+                                  arm64_reg dst_reg,
+                                  arm64_reg src_reg,
+                                  guint8 shift)
+{
+  GumArm64RegInfo rd;
+
+  gum_arm64_writer_describe_reg (self, dst_reg, &rd);
+
+  if (rd.width == 32 && (shift & 0xe0) != 0)
+    return FALSE;
+
+  return gum_arm64_writer_put_ubfm (self, dst_reg, src_reg,
+      shift, rd.width - 1);
+}
+
+gboolean
 gum_arm64_writer_put_tst_reg_imm (GumArm64Writer * self,
                                   arm64_reg reg,
                                   guint64 imm_value)
@@ -1623,7 +1733,6 @@ gboolean
 gum_arm64_writer_put_xpaci_reg (GumArm64Writer * self,
                                 arm64_reg reg)
 {
-
   GumArm64RegInfo ri;
 
   gum_arm64_writer_describe_reg (self, reg, &ri);
@@ -1647,6 +1756,26 @@ gum_arm64_writer_put_brk_imm (GumArm64Writer * self,
                               guint16 imm)
 {
   gum_arm64_writer_put_instruction (self, 0xd4200000 | (imm << 5));
+}
+
+gboolean
+gum_arm64_writer_put_mrs (GumArm64Writer * self,
+                          arm64_reg dst_reg,
+                          guint16 system_reg)
+{
+  GumArm64RegInfo rt;
+
+  gum_arm64_writer_describe_reg (self, dst_reg, &rt);
+
+  if (rt.width != 64 || (system_reg & 0x8000) != 0)
+    return FALSE;
+
+  gum_arm64_writer_put_instruction (self,
+      0xd5300000 |
+      (system_reg << 5) |
+      rt.index);
+
+  return TRUE;
 }
 
 static void
@@ -1841,6 +1970,7 @@ gum_arm64_writer_commit_literals (GumArm64Writer * self)
 {
   guint num_refs, ref_index;
   gpointer first_slot, last_slot;
+  GumArm64DataEndian data_endian;
 
   if (!gum_arm64_writer_has_literal_refs (self))
     return;
@@ -1852,11 +1982,12 @@ gum_arm64_writer_commit_literals (GumArm64Writer * self)
   first_slot = self->code;
   last_slot = first_slot;
 
+  data_endian = self->data_endian;
+
   for (ref_index = 0; ref_index != num_refs; ref_index++)
   {
     GumArm64LiteralRef * r;
-    gint64 * slot;
-    gint64 distance;
+    gint64 literal, * slot, distance;
     guint32 insn;
 
     r = gum_metal_array_element_at (&self->literal_refs, ref_index);
@@ -1864,15 +1995,22 @@ gum_arm64_writer_commit_literals (GumArm64Writer * self)
     if (r->width != GUM_LITERAL_64BIT)
       continue;
 
+    literal = r->val;
+
     for (slot = first_slot; slot != last_slot; slot++)
     {
-      if (GINT64_FROM_LE (*slot) == r->val)
+      gint64 candidate = (data_endian == G_LITTLE_ENDIAN)
+          ? GINT64_FROM_LE (*slot)
+          : GINT64_FROM_BE (*slot);
+      if (candidate == literal)
         break;
     }
 
     if (slot == last_slot)
     {
-      *slot = GINT64_TO_LE (r->val);
+      *slot = (data_endian == G_LITTLE_ENDIAN)
+          ? GINT64_TO_LE (literal)
+          : GINT64_TO_BE (literal);
       last_slot = slot + 1;
     }
 
@@ -1887,7 +2025,7 @@ gum_arm64_writer_commit_literals (GumArm64Writer * self)
   for (ref_index = 0; ref_index != num_refs; ref_index++)
   {
     GumArm64LiteralRef * r;
-    gint32 * slot;
+    gint32 literal, * slot;
     gint64 distance;
     guint32 insn;
 
@@ -1896,15 +2034,22 @@ gum_arm64_writer_commit_literals (GumArm64Writer * self)
     if (r->width != GUM_LITERAL_32BIT)
       continue;
 
+    literal = r->val;
+
     for (slot = first_slot; slot != last_slot; slot++)
     {
-      if (GINT32_FROM_LE (*slot) == r->val)
+      gint32 candidate = (data_endian == G_LITTLE_ENDIAN)
+          ? GINT32_FROM_LE (*slot)
+          : GINT32_FROM_BE (*slot);
+      if (candidate == literal)
         break;
     }
 
     if (slot == last_slot)
     {
-      *slot = GINT32_TO_LE (r->val);
+      *slot = (data_endian == G_LITTLE_ENDIAN)
+          ? GINT32_TO_LE (literal)
+          : GINT32_TO_BE (literal);
       last_slot = slot + 1;
     }
 

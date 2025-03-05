@@ -1,12 +1,12 @@
 /*
- * Copyright (C) 2010-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2010-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
 
 #include "gummemory.h"
 
-#include "gumdarwin.h"
+#include "gum/gumdarwin.h"
 #include "gummemory-priv.h"
 
 #include <errno.h>
@@ -253,6 +253,14 @@ gum_memory_is_readable (gconstpointer address,
   return is_readable;
 }
 
+gboolean
+gum_memory_query_protection (gconstpointer address,
+                             GumPageProtection * prot)
+{
+  return gum_darwin_query_protection (mach_task_self (), GUM_ADDRESS (address),
+      prot);
+}
+
 guint8 *
 gum_memory_read (gconstpointer address,
                  gsize len,
@@ -298,7 +306,7 @@ gum_darwin_read (mach_port_t task,
     page_offset = chunk_address - page_address;
     chunk_size = MIN (len - offset, page_size - page_offset);
 
-#ifdef HAVE_IOS
+#if defined (HAVE_IOS) || defined (HAVE_TVOS)
     mach_vm_size_t n_bytes_read;
 
     /* mach_vm_read corrupts memory on iOS */
@@ -572,7 +580,7 @@ gum_allocate_page_aligned (gpointer address,
   if (result == MAP_FAILED)
     return NULL;
 
-#if defined (HAVE_IOS) && !defined (HAVE_I386)
+#if (defined (HAVE_IOS) || defined (HAVE_TVOS)) && !defined (HAVE_I386)
   {
     gboolean need_checkra1n_quirk;
 

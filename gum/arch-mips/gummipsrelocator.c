@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2014-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C)      2019 Jon Wilson <jonwilson@zepler.net>
  *
  * Licence: wxWindows Library Licence, Version 3.1
@@ -70,6 +70,7 @@ gum_mips_relocator_init (GumMipsRelocator * relocator,
 {
   relocator->ref_count = 1;
 
+  cs_arch_register_mips ();
   cs_open (CS_ARCH_MIPS, GUM_DEFAULT_MIPS_MODE | GUM_DEFAULT_CS_ENDIAN,
       &relocator->capstone);
   cs_option (relocator->capstone, CS_OPT_DETAIL, CS_OPT_ON);
@@ -410,7 +411,7 @@ gum_mips_relocator_write_one (GumMipsRelocator * self)
 void
 gum_mips_relocator_write_all (GumMipsRelocator * self)
 {
-  guint count = 0;
+  G_GNUC_UNUSED guint count = 0;
 
   while (gum_mips_relocator_write_one (self))
     count++;

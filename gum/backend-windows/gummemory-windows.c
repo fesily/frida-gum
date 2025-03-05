@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2008-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2008 Christian Berentsen <jc.berentsen@gmail.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
@@ -8,7 +8,7 @@
 #include "gummemory.h"
 
 #include "gummemory-priv.h"
-#include "gumwindows.h"
+#include "gum/gumwindows.h"
 
 #include <stdlib.h>
 
@@ -47,6 +47,13 @@ gum_memory_is_readable (gconstpointer address,
     return FALSE;
 
   return (prot & GUM_PAGE_READ) != 0;
+}
+
+gboolean
+gum_memory_query_protection (gconstpointer address,
+                             GumPageProtection * prot)
+{
+  return gum_memory_get_protection (address, 1, prot);
 }
 
 guint8 *

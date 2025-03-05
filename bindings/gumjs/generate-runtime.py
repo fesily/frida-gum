@@ -1,5 +1,3 @@
-#!/usr/bin/env python3
-
 from base64 import b64decode
 import json
 import os
@@ -16,63 +14,60 @@ RELAXED_DEPS = {
 }
 
 EXACT_DEPS = {
-    "frida-java-bridge": "6.2.3",
-    "frida-objc-bridge": "7.0.3",
-    "frida-swift-bridge": "2.0.6"
+    "frida-java-bridge": "6.3.8",
+    "frida-objc-bridge": "7.1.0",
+    "frida-swift-bridge": "2.0.8"
 }
 
 
-def generate_runtime(backends, arch, endian, input_dir, gum_dir, capstone_incdir, libtcc_incdir, quickcompile, output_dir):
-    frida_compile = output_dir / "node_modules" / ".bin" / make_script_filename("frida-compile")
+def main(argv):
+    output_dir, priv_dir, input_dir, gum_dir, capstone_incdir, libtcc_incdir, npm, quickcompile = \
+            [Path(d).resolve() if d else None for d in argv[1:9]]
+    backends = set(argv[9].split(","))
+    arch, endian = argv[10:]
+
+    try:
+        generate_runtime(output_dir, priv_dir, input_dir, gum_dir, capstone_incdir, libtcc_incdir,
+                         npm, quickcompile,
+                         backends, arch, endian)
+    except Exception as e:
+        print(e, file=sys.stderr)
+        sys.exit(1)
+
+
+def generate_runtime(output_dir, priv_dir, input_dir, gum_dir, capstone_incdir, libtcc_incdir, npm, quickcompile, backends, arch, endian):
+    frida_compile = priv_dir / "node_modules" / ".bin" / make_script_filename("frida-compile")
     if not frida_compile.exists():
-        pkg_files = [output_dir / "package.json", output_dir / "package-lock.json"]
-        for f in pkg_files:
-            if f.exists():
-                f.unlink()
-        (output_dir / "tsconfig.json").write_text("{ \"files\": [], \"compilerOptions\": { \"typeRoots\": [] } }", encoding="utf-8")
+        if priv_dir.exists():
+            shutil.rmtree(priv_dir)
+        priv_dir.mkdir()
 
-        node_modules = output_dir / "node_modules"
-        if node_modules.exists():
-            shutil.rmtree(node_modules)
+        (priv_dir / "tsconfig.json").write_text("{ \"files\": [], \"compilerOptions\": { \"typeRoots\": [] } }", encoding="utf-8")
 
-        npm = os.environ.get("NPM", make_script_filename("npm"))
-        try:
-            subprocess.run([npm, "init", "-y"],
-                           capture_output=True,
-                           cwd=output_dir,
-                           check=True)
-            subprocess.run([npm, "install"] + [f"{name}@{version_spec}" for name, version_spec in RELAXED_DEPS.items()],
-                           capture_output=True,
-                           cwd=output_dir,
-                           check=True)
-            subprocess.run([npm, "install", "-E"] + [f"{name}@{version_spec}" for name, version_spec in EXACT_DEPS.items()],
-                           capture_output=True,
-                           cwd=output_dir,
-                           check=True)
-        except Exception as e:
-            message = "\n".join([
-                "",
-                "***",
-                "Failed to bootstrap frida-compile:",
-                "\t" + str(e),
-                "It appears Node.js is not installed.",
-                "We need it for processing JavaScript code at build-time.",
-                "Check PATH or set NPM to the absolute path of your npm binary.",
-                "***\n",
-            ])
-            raise EnvironmentError(message)
-
+        subprocess.run([npm, "init", "-y"],
+                       capture_output=True,
+                       cwd=priv_dir,
+                       check=True)
+        subprocess.run([npm, "install"] + [f"{name}@{version_spec}" for name, version_spec in RELAXED_DEPS.items()],
+                       capture_output=True,
+                       cwd=priv_dir,
+                       check=True)
+        subprocess.run([npm, "install", "-E"] + [f"{name}@{version_spec}" for name, version_spec in EXACT_DEPS.items()],
+                       capture_output=True,
+                       cwd=priv_dir,
+                       check=True)
 
     runtime_reldir = Path("runtime")
     runtime_srcdir = input_dir / runtime_reldir
-    runtime_intdir = output_dir / runtime_reldir
+    runtime_intdir = priv_dir / runtime_reldir
     if runtime_intdir.exists():
         shutil.rmtree(runtime_intdir)
     shutil.copytree(runtime_srcdir, runtime_intdir)
 
+    call_compiler = lambda *args: subprocess.run([frida_compile, *args], cwd=priv_dir, check=True)
 
     if "qjs" in backends:
-        quick_tmp_dir = Path("runtime-build-quick")
+        quick_tmp_dir = Path("out-qjs")
         runtime = quick_tmp_dir / "frida.js"
         objc = quick_tmp_dir / "objc.js"
         swift = quick_tmp_dir / "swift.js"
@@ -81,23 +76,22 @@ def generate_runtime(backends, arch, endian, input_dir, gum_dir, capstone_incdir
         quick_options = [
             "-c", # Compress for smaller code and better performance.
         ]
-        subprocess.run([frida_compile, runtime_reldir / "entrypoint-quickjs.js", "-o", runtime] + quick_options, cwd=output_dir, check=True)
-        subprocess.run([frida_compile, runtime_reldir / "objc.js", "-o", objc] + quick_options, cwd=output_dir, check=True)
-        subprocess.run([frida_compile, runtime_reldir / "swift.js", "-o", swift] + quick_options, cwd=output_dir, check=True)
-        subprocess.run([frida_compile, runtime_reldir / "java.js", "-o", java] + quick_options, cwd=output_dir, check=True)
+        call_compiler(runtime_reldir / "entrypoint-quickjs.js", "-o", runtime, *quick_options)
+        call_compiler(runtime_reldir / "objc.js", "-o", objc, *quick_options)
+        call_compiler(runtime_reldir / "swift.js", "-o", swift, *quick_options)
+        call_compiler(runtime_reldir / "java.js", "-o", java, *quick_options)
 
         qcflags = []
         if endian != sys.byteorder:
             qcflags.append("--bswap")
 
-        generate_runtime_quick("runtime", output_dir, "gumquickscript-runtime.h", [runtime], quickcompile, qcflags)
-        generate_runtime_quick("objc", output_dir, "gumquickscript-objc.h", [objc], quickcompile, qcflags)
-        generate_runtime_quick("swift", output_dir, "gumquickscript-swift.h", [swift], quickcompile, qcflags)
-        generate_runtime_quick("java", output_dir, "gumquickscript-java.h", [java], quickcompile, qcflags)
-
+        generate_runtime_quick("runtime", output_dir, priv_dir, "gumquickscript-runtime.h", [runtime], quickcompile, qcflags)
+        generate_runtime_quick("objc", output_dir, priv_dir, "gumquickscript-objc.h", [objc], quickcompile, qcflags)
+        generate_runtime_quick("swift", output_dir, priv_dir, "gumquickscript-swift.h", [swift], quickcompile, qcflags)
+        generate_runtime_quick("java", output_dir, priv_dir, "gumquickscript-java.h", [java], quickcompile, qcflags)
 
     if "v8" in backends:
-        v8_tmp_dir = Path("runtime-build-v8")
+        v8_tmp_dir = Path("out-v8")
         runtime = v8_tmp_dir / "frida.js"
         objc = v8_tmp_dir / "objc.js"
         swift = v8_tmp_dir / "swift.js"
@@ -106,32 +100,33 @@ def generate_runtime(backends, arch, endian, input_dir, gum_dir, capstone_incdir
         v8_options = [
             "-c", # Compress for smaller code and better performance.
         ]
-        subprocess.run([frida_compile, runtime_reldir / "entrypoint-v8.js", "-o", runtime] + v8_options, cwd=output_dir, check=True)
-        subprocess.run([frida_compile, runtime_reldir / "objc.js", "-o", objc] + v8_options, cwd=output_dir, check=True)
-        subprocess.run([frida_compile, runtime_reldir / "swift.js", "-o", swift] + v8_options, cwd=output_dir, check=True)
-        subprocess.run([frida_compile, runtime_reldir / "java.js", "-o", java] + v8_options, cwd=output_dir, check=True)
+        call_compiler(runtime_reldir / "entrypoint-v8.js", "-o", runtime, *v8_options)
+        call_compiler(runtime_reldir / "objc.js", "-o", objc, *v8_options)
+        call_compiler(runtime_reldir / "swift.js", "-o", swift, *v8_options)
+        call_compiler(runtime_reldir / "java.js", "-o", java, *v8_options)
 
-        generate_runtime_v8("runtime", output_dir, "gumv8script-runtime.h", [runtime])
-        generate_runtime_v8("objc", output_dir, "gumv8script-objc.h", [objc])
-        generate_runtime_v8("swift", output_dir, "gumv8script-swift.h", [swift])
-        generate_runtime_v8("java", output_dir, "gumv8script-java.h", [java])
+        generate_runtime_v8("runtime", output_dir, priv_dir, "gumv8script-runtime.h", [runtime])
+        generate_runtime_v8("objc", output_dir, priv_dir, "gumv8script-objc.h", [objc])
+        generate_runtime_v8("swift", output_dir, priv_dir, "gumv8script-swift.h", [swift])
+        generate_runtime_v8("java", output_dir, priv_dir, "gumv8script-java.h", [java])
+
+    generate_runtime_cmodule(output_dir, "gumcmodule-runtime.h", input_dir, gum_dir, capstone_incdir, libtcc_incdir, arch)
+
+    (output_dir / "runtime.bundle").write_bytes(b"")
 
 
-    generate_runtime_cmodule(output_dir, "gumcmodule-runtime.h", arch, input_dir, gum_dir, capstone_incdir, libtcc_incdir)
-
-
-def generate_runtime_quick(runtime_name, output_dir, output, inputs, quickcompile, flags):
+def generate_runtime_quick(runtime_name, output_dir, priv_dir, output, inputs, quickcompile, flags):
     with (output_dir / output).open('w', encoding='utf-8') as output_file:
         output_file.write("#include \"gumquickbundle.h\"\n")
 
         modules = []
         for input_relpath in inputs:
-            input_path = output_dir / input_relpath
+            input_path = priv_dir / input_relpath
             stem = input_relpath.stem
 
             input_quick_relpath = input_relpath.parent / (stem + ".qjs")
-            input_quick_path = output_dir / input_quick_relpath
-            subprocess.run([quickcompile] + flags + [input_relpath, input_quick_relpath], cwd=output_dir, check=True)
+            input_quick_path = priv_dir / input_quick_relpath
+            subprocess.run([quickcompile] + flags + [input_relpath, input_quick_relpath], cwd=priv_dir, check=True)
             bytecode = input_quick_path.read_bytes()
             bytecode_size = len(bytecode)
 
@@ -140,7 +135,7 @@ def generate_runtime_quick(runtime_name, output_dir, output, inputs, quickcompil
             input_source_map_identifier = "gumjs_{0}_source_map".format(stem_cname)
 
             output_file.write("\nstatic const guint8 {0}[{1}] =\n{{".format(input_bytecode_identifier, bytecode_size))
-            write_bytes(bytecode, output_file)
+            write_bytes(bytecode, output_file, 'unsigned')
             output_file.write("\n};\n")
 
             source_code = input_path.read_text(encoding='utf-8')
@@ -152,7 +147,7 @@ def generate_runtime_quick(runtime_name, output_dir, output, inputs, quickcompil
                 source_map_size = len(source_map_bytes)
 
                 output_file.write("\nstatic const gchar {0}[{1}] =\n{{".format(input_source_map_identifier, source_map_size))
-                write_bytes(source_map_bytes, output_file)
+                write_bytes(source_map_bytes, output_file, 'signed')
                 output_file.write("\n};\n")
 
                 modules.append((input_bytecode_identifier, bytecode_size, input_source_map_identifier))
@@ -166,13 +161,13 @@ def generate_runtime_quick(runtime_name, output_dir, output, inputs, quickcompil
         output_file.write("\n  { NULL, 0, NULL }\n};")
 
 
-def generate_runtime_v8(runtime_name, output_dir, output, inputs):
+def generate_runtime_v8(runtime_name, output_dir, priv_dir, output, inputs):
     with (output_dir / output).open('w', encoding='utf-8') as output_file:
         output_file.write("#include \"gumv8bundle.h\"\n")
 
         modules = []
         for input_relpath in inputs:
-            input_path = output_dir / input_relpath
+            input_path = priv_dir / input_relpath
             input_name = input_relpath.name
 
             stem_cname = identifier(input_relpath.stem)
@@ -186,7 +181,7 @@ def generate_runtime_v8(runtime_name, output_dir, output, inputs):
             source_code_size = len(source_code_bytes)
 
             output_file.write("\nstatic const gchar {0}[{1}] =\n{{".format(input_source_code_identifier, source_code_size))
-            write_bytes(source_code_bytes, output_file)
+            write_bytes(source_code_bytes, output_file, 'signed')
             output_file.write("\n};\n")
 
             if source_map is not None:
@@ -195,7 +190,7 @@ def generate_runtime_v8(runtime_name, output_dir, output, inputs):
                 source_map_size = len(source_map_bytes)
 
                 output_file.write("\nstatic const gchar {0}[{1}] =\n{{".format(input_source_map_identifier, source_map_size))
-                write_bytes(source_map_bytes, output_file)
+                write_bytes(source_map_bytes, output_file, 'signed')
                 output_file.write("\n};\n")
 
                 modules.append((input_name, input_source_code_identifier, input_source_map_identifier))
@@ -210,7 +205,7 @@ def generate_runtime_v8(runtime_name, output_dir, output, inputs):
 
 
 cmodule_function_pattern = re.compile(
-        r"^(void|size_t|int|unsigned int|bool|const char \*|gpointer|gsize|gssize|gint[0-9]*|guint[0-9]*|gfloat|gdouble|gboolean||(?:const )?\w+ \*|Gum\w+|cs_err) ([a-z][a-z0-9_]+)\s?\(",
+        r"^(void|size_t|int|unsigned int|bool|const char \*|gpointer|gsize|gssize|gint[0-9]*|guint[0-9]*|gfloat|gdouble|gboolean||(?:const )?\w+ \*|Gum\w+|csh|cs_err) ([a-z][a-z0-9_]+)\s?\(",
     re.MULTILINE)
 cmodule_variable_pattern = re.compile(r"^(extern .+? )(\w+);", re.MULTILINE)
 capstone_include_pattern = re.compile(r'^#include "(\w+)\.h"$', re.MULTILINE)
@@ -220,7 +215,7 @@ c_comment_pattern = re.compile(r"\/\*(\*(?!\/)|[^*])*\*\/")
 cpp_comment_pattern = re.compile(r"\s+?\/\/.+")
 
 
-def generate_runtime_cmodule(output_dir, output, arch, input_dir, gum_dir, capstone_incdir, libtcc_incdir):
+def generate_runtime_cmodule(output_dir, output, input_dir, gum_dir, capstone_incdir, libtcc_incdir, arch):
     if arch.startswith("x86") or arch == "x64":
         writer_arch = "x86"
     elif arch.startswith("mips"):
@@ -266,11 +261,14 @@ def generate_runtime_cmodule(output_dir, output, arch, input_dir, gum_dir, capst
 
     inputs = [
         (input_dir / "runtime" / "cmodule", None, is_header, identity_transform, 'GUM_CHEADER_FRIDA'),
-        (input_dir / "runtime" / "cmodule-tcc", None, is_header, identity_transform, 'GUM_CHEADER_TCC'),
-        (libtcc_incdir, None, libtcc_is_header, identity_transform, 'GUM_CHEADER_TCC'),
         (gum_dir / ("arch-" + writer_arch), gum_dir.parent, gum_header_matches_writer, optimize_gum_header, 'GUM_CHEADER_FRIDA'),
         (capstone_incdir, None, capstone_header_matches_arch, optimize_capstone_header, 'GUM_CHEADER_FRIDA'),
     ]
+    if libtcc_incdir is not None:
+        inputs += [
+            (input_dir / "runtime" / "cmodule-tcc", None, is_header, identity_transform, 'GUM_CHEADER_TCC'),
+            (libtcc_incdir, None, libtcc_is_header, identity_transform, 'GUM_CHEADER_TCC'),
+        ]
 
     with (output_dir / output).open('w', encoding='utf-8') as output_file:
         modules = []
@@ -283,6 +281,8 @@ def generate_runtime_cmodule(output_dir, output, arch, input_dir, gum_dir, capst
                 for pattern in (cmodule_function_pattern, cmodule_variable_pattern):
                     for m in pattern.finditer(header_source):
                         name = m.group(2)
+                        if name.startswith("cs_arch_register_"):
+                            continue
                         symbols.append(name)
 
                 source_bytes = bytearray(header_source.encode('utf-8'))
@@ -290,7 +290,7 @@ def generate_runtime_cmodule(output_dir, output, arch, input_dir, gum_dir, capst
                 source_size = len(source_bytes)
 
                 output_file.write("static const gchar {0}[{1}] =\n{{".format(input_identifier, source_size))
-                write_bytes(source_bytes, output_file)
+                write_bytes(source_bytes, output_file, 'signed')
                 output_file.write("\n};\n\n")
 
                 modules.append((header_name, input_identifier, source_size - 1, header_kind))
@@ -315,7 +315,16 @@ gum_cmodule_get_symbols (void)
 
     symbols = g_hash_table_new_full (g_str_hash, g_str_equal, NULL, NULL);
 
+#ifdef _MSC_VER
+# pragma warning (push)
+# pragma warning (disable: 4996)
+#endif
+
 {insertions}
+
+#ifdef _MSC_VER
+# pragma warning (pop)
+#endif
 
     _gum_register_destructor (gum_cmodule_deinit_symbols);
 
@@ -388,8 +397,7 @@ def to_canonical_source_path(path):
     return "frida/" + path
 
 
-def write_bytes(data, sink):
-    "Write bytes as signed integers between -128 and 127."
+def write_bytes(data, sink, encoding):
     sink.write("\n  ")
     line_length = 0
     offset = 0
@@ -400,8 +408,7 @@ def write_bytes(data, sink):
         if line_length >= 70:
             sink.write("\n  ")
             line_length = 0
-        # Convert unsigned to signed for UTF-8.
-        if b >= 128:
+        if encoding == 'signed' and b >= 128:
             b -= 256
         token = str(b)
         sink.write(token)
@@ -429,12 +436,4 @@ def make_script_filename(name):
 
 
 if __name__ == '__main__':
-    backends = set(sys.argv[1].split(","))
-    arch, endian = sys.argv[2:4]
-    input_dir, gum_dir, capstone_incdir, libtcc_incdir, quickcompile, output_dir = [Path(d).resolve() for d in sys.argv[4:]]
-
-    try:
-        generate_runtime(backends, arch, endian, input_dir, gum_dir, capstone_incdir, libtcc_incdir, quickcompile, output_dir)
-    except Exception as e:
-        print(e, file=sys.stderr)
-        sys.exit(1)
+    main(sys.argv)

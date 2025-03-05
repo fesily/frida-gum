@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2008-2025 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2008 Christian Berentsen <jc.berentsen@gmail.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
@@ -9,13 +9,13 @@
 
 #include "valgrind.h"
 #ifdef HAVE_ANDROID
-# include "backend-linux/gumandroid.h"
+# include "gum/gumandroid.h"
 #endif
 #ifdef HAVE_FREEBSD
-# include "backend-freebsd/gumfreebsd.h"
+# include "gum/gumfreebsd.h"
 #endif
 #ifdef HAVE_QNX
-# include "backend-qnx/gumqnx.h"
+# include "gum/gumqnx.h"
 #endif
 
 #if defined (HAVE_WINDOWS) && defined (_DEBUG)
@@ -171,33 +171,14 @@ TESTCASE (line_diff)
 
 /* Implementation */
 
-static gboolean gum_test_assign_own_range_if_matching (
-    const GumModuleDetails * details, gpointer user_data);
-
-static GumMemoryRange _test_util_own_range = { 0, 0 };
+static const GumMemoryRange * _test_util_own_range;
 static gchar * _test_util_system_module_name = NULL;
 static GumHeapApiList * _test_util_heap_apis = NULL;
 
 void
 _test_util_init (void)
 {
-  gum_process_enumerate_modules (gum_test_assign_own_range_if_matching,
-      &_test_util_own_range);
-}
-
-static gboolean
-gum_test_assign_own_range_if_matching (const GumModuleDetails * details,
-                                       gpointer user_data)
-{
-  if (GUM_MEMORY_RANGE_INCLUDES (details->range,
-      GUM_ADDRESS (gum_test_assign_own_range_if_matching)))
-  {
-    GumMemoryRange * own_range = user_data;
-    memcpy (own_range, details->range, sizeof (GumMemoryRange));
-    return FALSE;
-  }
-
-  return TRUE;
+  _test_util_own_range = gum_module_get_range (gum_process_get_main_module ());
 }
 
 void
@@ -449,13 +430,33 @@ test_util_heap_apis (void)
   return _test_util_heap_apis;
 }
 
-#ifdef HAVE_WINDOWS
-
 gboolean
 gum_is_debugger_present (void)
 {
+#if defined (HAVE_WINDOWS)
   return IsDebuggerPresent ();
+#elif defined (HAVE_DARWIN)
+  int mib[4];
+  struct kinfo_proc info;
+  size_t size;
+
+  info.kp_proc.p_flag = 0;
+  mib[0] = CTL_KERN;
+  mib[1] = KERN_PROC;
+  mib[2] = KERN_PROC_PID;
+  mib[3] = getpid ();
+
+  size = sizeof (info);
+  sysctl (mib, G_N_ELEMENTS (mib), &info, &size, NULL, 0);
+
+  return (info.kp_proc.p_flag & P_TRACED) != 0;
+#else
+  /* FIXME */
+  return FALSE;
+#endif
 }
+
+#if defined (_MSC_VER)
 
 guint8
 gum_try_read_and_write_at (guint8 * a,
@@ -493,41 +494,92 @@ gum_try_read_and_write_at (guint8 * a,
   return dummy_value_to_trick_optimizer;
 }
 
-#else
+#elif defined (HAVE_WINDOWS)
 
-#ifdef HAVE_DARWIN
-# define GUM_SETJMP(env) setjmp (env)
-# define GUM_LONGJMP(env, val) longjmp (env, val)
-  typedef jmp_buf gum_jmp_buf;
-#else
-# define GUM_SETJMP(env) sigsetjmp (env, 1)
-# define GUM_LONGJMP(env, val) siglongjmp (env, val)
-  typedef sigjmp_buf gum_jmp_buf;
-#endif
+static WINAPI LONG on_exception (PEXCEPTION_POINTERS info);
+static void recover_from_exception (void);
 
-gboolean
-gum_is_debugger_present (void)
+static jmp_buf gum_try_read_and_write_context;
+static guint64 gum_temp_stack[512];
+
+guint8
+gum_try_read_and_write_at (guint8 * a,
+                           guint i,
+                           gboolean * exception_raised_on_read,
+                           gboolean * exception_raised_on_write)
 {
-#ifdef HAVE_DARWIN
-  int mib[4];
-  struct kinfo_proc info;
-  size_t size;
+  guint8 dummy_value_to_trick_optimizer = 0;
+  GumExceptor * exceptor;
+  PVOID handler;
 
-  info.kp_proc.p_flag = 0;
-  mib[0] = CTL_KERN;
-  mib[1] = KERN_PROC;
-  mib[2] = KERN_PROC_PID;
-  mib[3] = getpid ();
+  if (exception_raised_on_read != NULL)
+    *exception_raised_on_read = FALSE;
+  if (exception_raised_on_write != NULL)
+    *exception_raised_on_write = FALSE;
 
-  size = sizeof (info);
-  sysctl (mib, G_N_ELEMENTS (mib), &info, &size, NULL, 0);
+  exceptor = gum_exceptor_obtain ();
 
-  return (info.kp_proc.p_flag & P_TRACED) != 0;
-#else
-  /* FIXME */
-  return FALSE;
-#endif
+  handler = AddVectoredExceptionHandler (TRUE, on_exception);
+
+  if (setjmp (gum_try_read_and_write_context) == 0)
+  {
+    dummy_value_to_trick_optimizer = a[i];
+  }
+  else
+  {
+    if (exception_raised_on_read != NULL)
+      *exception_raised_on_read = TRUE;
+  }
+
+  if (setjmp (gum_try_read_and_write_context) == 0)
+  {
+    a[i] = 42;
+  }
+  else
+  {
+    if (exception_raised_on_write != NULL)
+      *exception_raised_on_write = TRUE;
+  }
+
+  RemoveVectoredExceptionHandler (handler);
+
+  g_object_unref (exceptor);
+
+  return dummy_value_to_trick_optimizer;
 }
+
+static WINAPI LONG
+on_exception (PEXCEPTION_POINTERS info)
+{
+# if GLIB_SIZEOF_VOID_P == 8
+  info->ContextRecord->Rip = GPOINTER_TO_SIZE (recover_from_exception);
+  info->ContextRecord->Rsp = GPOINTER_TO_SIZE (gum_temp_stack +
+      G_N_ELEMENTS (gum_temp_stack));
+# else
+  info->ContextRecord->Eip = GPOINTER_TO_SIZE (recover_from_exception);
+  info->ContextRecord->Esp = GPOINTER_TO_SIZE (gum_temp_stack +
+      G_N_ELEMENTS (gum_temp_stack));
+# endif
+  return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+static void
+recover_from_exception (void)
+{
+  longjmp (gum_try_read_and_write_context, 1337);
+}
+
+#else
+
+# ifdef HAVE_DARWIN
+#  define GUM_SETJMP(env) setjmp (env)
+#  define GUM_LONGJMP(env, val) longjmp (env, val)
+   typedef jmp_buf gum_jmp_buf;
+# else
+#  define GUM_SETJMP(env) sigsetjmp (env, 1)
+#  define GUM_LONGJMP(env, val) siglongjmp (env, val)
+   typedef sigjmp_buf gum_jmp_buf;
+# endif
 
 static gum_jmp_buf gum_try_read_and_write_context;
 static struct sigaction gum_test_old_sigsegv;
@@ -563,7 +615,7 @@ gum_test_should_forward_signal_to (gpointer handler)
   if (handler == NULL)
     return FALSE;
 
-  return GUM_MEMORY_RANGE_INCLUDES (&_test_util_own_range,
+  return GUM_MEMORY_RANGE_INCLUDES (_test_util_own_range,
       GUM_ADDRESS (handler));
 }
 
@@ -590,12 +642,12 @@ gum_try_read_and_write_at (guint8 * a,
   sigaction (SIGSEGV, &action, &gum_test_old_sigsegv);
   sigaction (SIGBUS, &action, &gum_test_old_sigbus);
 
-#ifdef HAVE_ANDROID
+# ifdef HAVE_ANDROID
   /* Work-around for Bionic bug up to and including Android L */
   sigset_t mask;
 
   sigprocmask (SIG_SETMASK, NULL, &mask);
-#endif
+# endif
 
   if (GUM_SETJMP (gum_try_read_and_write_context) == 0)
   {
@@ -605,21 +657,11 @@ gum_try_read_and_write_at (guint8 * a,
   {
     if (exception_raised_on_read != NULL)
       *exception_raised_on_read = TRUE;
-
-#ifdef HAVE_DARWIN
-    /*
-     * The Darwin Exceptor backend will currently disengage on an unhandled
-     * exception. This is because guarded Mach ports may make it impossible
-     * to forward to the previous handler. We may potentially improve on
-     * this by detecting that the process has guarded ports.
-     */
-    gum_exceptor_reset (exceptor);
-#endif
   }
 
-#ifdef HAVE_ANDROID
+# ifdef HAVE_ANDROID
   sigprocmask (SIG_SETMASK, &mask, NULL);
-#endif
+# endif
 
   if (GUM_SETJMP (gum_try_read_and_write_context) == 0)
   {
@@ -629,15 +671,11 @@ gum_try_read_and_write_at (guint8 * a,
   {
     if (exception_raised_on_write != NULL)
       *exception_raised_on_write = TRUE;
-
-#ifdef HAVE_DARWIN
-    gum_exceptor_reset (exceptor);
-#endif
   }
 
-#ifdef HAVE_ANDROID
+# ifdef HAVE_ANDROID
   sigprocmask (SIG_SETMASK, &mask, NULL);
-#endif
+# endif
 
   sigaction (SIGSEGV, &gum_test_old_sigsegv, NULL);
   memset (&gum_test_old_sigsegv, 0, sizeof (gum_test_old_sigsegv));
@@ -827,4 +865,17 @@ append_indent (GString * str,
 
   for (i = 0; i < indent_level; i++)
     g_string_append (str, "  ");
+}
+
+void
+gum_ensure_current_thread_is_named (const gchar * name)
+{
+  /*
+   * On Linux g_thread_new() may not actually set the thread name, which is due
+   * to GLib potentially having been prebuilt against an old libc. Therefore we
+   * set the name manually using pthreads.
+   */
+#if defined (HAVE_LINUX) && defined (HAVE_PTHREAD_SETNAME_NP)
+  pthread_setname_np (pthread_self (), name);
+#endif
 }

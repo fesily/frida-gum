@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2008-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2008 Christian Berentsen <jc.berentsen@gmail.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
@@ -27,7 +27,9 @@ typedef guint GumRwxSupport;
 typedef guint GumMemoryOperation;
 typedef guint GumPageProtection;
 typedef struct _GumAddressSpec GumAddressSpec;
+typedef struct _GumRangeDetails GumRangeDetails;
 typedef struct _GumMemoryRange GumMemoryRange;
+typedef struct _GumFileMapping GumFileMapping;
 typedef struct _GumMatchPattern GumMatchPattern;
 
 typedef gboolean (* GumMemoryIsNearFunc) (gpointer memory, gpointer address);
@@ -68,12 +70,28 @@ struct _GumAddressSpec
   gsize max_distance;
 };
 
+struct _GumRangeDetails
+{
+  const GumMemoryRange * range;
+  GumPageProtection protection;
+  const GumFileMapping * file;
+};
+
 struct _GumMemoryRange
 {
   GumAddress base_address;
   gsize size;
 };
 
+struct _GumFileMapping
+{
+  const gchar * path;
+  guint64 offset;
+  gsize size;
+};
+
+typedef gboolean (* GumFoundRangeFunc) (const GumRangeDetails * details,
+    gpointer user_data);
 typedef void (* GumMemoryPatchApplyFunc) (gpointer mem, gpointer user_data);
 typedef gboolean (* GumMemoryScanMatchFunc) (GumAddress address, gsize size,
     gpointer user_data);
@@ -90,6 +108,8 @@ GUM_API guint gum_query_page_size (void);
 GUM_API gboolean gum_query_is_rwx_supported (void);
 GUM_API GumRwxSupport gum_query_rwx_support (void);
 GUM_API gboolean gum_memory_is_readable (gconstpointer address, gsize len);
+GUM_API gboolean gum_memory_query_protection (gconstpointer address,
+    GumPageProtection * prot);
 GUM_API guint8 * gum_memory_read (gconstpointer address, gsize len,
     gsize * n_bytes_read);
 GUM_API gboolean gum_memory_write (gpointer address, const guint8 * bytes,
@@ -102,9 +122,7 @@ GUM_API void gum_memory_scan (const GumMemoryRange * range,
     const GumMatchPattern * pattern, GumMemoryScanMatchFunc func,
     gpointer user_data);
 
-#ifndef GUM_DIET
 GUM_API GType gum_match_pattern_get_type (void) G_GNUC_CONST;
-#endif
 GUM_API GumMatchPattern * gum_match_pattern_new_from_string (
     const gchar * pattern_str);
 GUM_API GumMatchPattern * gum_match_pattern_ref (GumMatchPattern * pattern);
@@ -162,9 +180,7 @@ GUM_API gboolean gum_memory_decommit (gpointer address, gsize size);
 GUM_API gboolean gum_address_spec_is_satisfied_by (const GumAddressSpec * spec,
     gconstpointer address);
 
-#ifndef GUM_DIET
 GUM_API GType gum_memory_range_get_type (void) G_GNUC_CONST;
-#endif
 GUM_API GumMemoryRange * gum_memory_range_copy (const GumMemoryRange * range);
 GUM_API void gum_memory_range_free (GumMemoryRange * range);
 

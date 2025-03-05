@@ -1,5 +1,7 @@
 /*
  * Copyright (C) 2009-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2023 Fabian Freyer <fabian.freyer@physik.tu-berlin.de>
+ * Copyright (C) 2024 Yannis Juglaret <yjuglaret@mozilla.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -168,6 +170,7 @@ gum_x86_writer_reset (GumX86Writer * writer,
   writer->target_cpu = GUM_CPU_AMD64;
 #endif
   writer->target_abi = GUM_NATIVE_ABI;
+  writer->cpu_features = gum_query_cpu_features ();
 
   writer->base = (guint8 *) code_address;
   writer->code = (guint8 *) code_address;
@@ -2369,6 +2372,24 @@ gum_x86_writer_put_mov_reg_fs_u32_ptr (GumX86Writer * self,
   return gum_x86_writer_put_mov_reg_imm_ptr (self, dst_reg, fs_offset);
 }
 
+void
+gum_x86_writer_put_mov_fs_reg_ptr_reg (GumX86Writer * self,
+                                       GumX86Reg fs_offset,
+                                       GumX86Reg src_reg)
+{
+  gum_x86_writer_put_u8 (self, 0x65);
+  gum_x86_writer_put_mov_reg_ptr_reg (self, fs_offset, src_reg);
+}
+
+void
+gum_x86_writer_put_mov_reg_fs_reg_ptr (GumX86Writer * self,
+                                       GumX86Reg dst_reg,
+                                       GumX86Reg fs_offset)
+{
+  gum_x86_writer_put_u8 (self, 0x65);
+  gum_x86_writer_put_mov_reg_reg_ptr (self, dst_reg, fs_offset);
+}
+
 gboolean
 gum_x86_writer_put_mov_gs_u32_ptr_reg (GumX86Writer * self,
                                        guint32 fs_offset,
@@ -2385,6 +2406,24 @@ gum_x86_writer_put_mov_reg_gs_u32_ptr (GumX86Writer * self,
 {
   gum_x86_writer_put_u8 (self, 0x65);
   return gum_x86_writer_put_mov_reg_imm_ptr (self, dst_reg, fs_offset);
+}
+
+void
+gum_x86_writer_put_mov_gs_reg_ptr_reg (GumX86Writer * self,
+                                       GumX86Reg gs_offset,
+                                       GumX86Reg src_reg)
+{
+  gum_x86_writer_put_u8 (self, 0x65);
+  gum_x86_writer_put_mov_reg_ptr_reg (self, gs_offset, src_reg);
+}
+
+void
+gum_x86_writer_put_mov_reg_gs_reg_ptr (GumX86Writer * self,
+                                       GumX86Reg dst_reg,
+                                       GumX86Reg gs_offset)
+{
+  gum_x86_writer_put_u8 (self, 0x65);
+  gum_x86_writer_put_mov_reg_reg_ptr (self, dst_reg, gs_offset);
 }
 
 void

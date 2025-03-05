@@ -1,6 +1,7 @@
 /*
- * Copyright (C) 2010-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2010-2025 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2013 Karl Trygve Kalleberg <karltk@boblycat.org>
+ * Copyright (C) 2024 Håvard Sørbø <havard@hsorbo.no>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -151,6 +152,7 @@ static void gum_v8_script_execute_entrypoints (GumV8Script * self,
     GumScriptTask * task);
 static void gum_v8_script_on_entrypoints_executed (
     const FunctionCallbackInfo<Value> & info);
+static gboolean gum_v8_script_complete_load_task (GumScriptTask * task);
 static void gum_v8_script_unload (GumScript * script,
     GCancellable * cancellable, GAsyncReadyCallback callback,
     gpointer user_data);
@@ -516,9 +518,9 @@ gum_v8_script_create_context (GumV8Script * self,
     _gum_v8_kernel_init (&self->kernel, &self->core, global_templ);
     _gum_v8_memory_init (&self->memory, &self->core, global_templ);
     _gum_v8_module_init (&self->module, &self->core, global_templ);
-    _gum_v8_process_init (&self->process, &self->module, &self->core,
-        global_templ);
     _gum_v8_thread_init (&self->thread, &self->core, global_templ);
+    _gum_v8_process_init (&self->process, &self->module, &self->thread,
+        &self->core, global_templ);
     _gum_v8_file_init (&self->file, &self->core, global_templ);
     _gum_v8_checksum_init (&self->checksum, &self->core, global_templ);
     _gum_v8_stream_init (&self->stream, &self->core, global_templ);
@@ -537,6 +539,10 @@ gum_v8_script_create_context (GumV8Script * self,
         &self->instruction, &self->core, global_templ);
     _gum_v8_stalker_init (&self->stalker, &self->code_writer,
         &self->instruction, &self->core, global_templ);
+    _gum_v8_cloak_init (&self->cloak, &self->core, global_templ);
+    _gum_v8_sampler_init (&self->sampler, &self->core, global_templ);
+    _gum_v8_profiler_init (&self->profiler, &self->sampler, &self->interceptor,
+        &self->core, global_templ);
 
     Local<Context> context (Context::New (isolate, NULL, global_templ));
     {
@@ -552,8 +558,8 @@ gum_v8_script_create_context (GumV8Script * self,
     _gum_v8_kernel_realize (&self->kernel);
     _gum_v8_memory_realize (&self->memory);
     _gum_v8_module_realize (&self->module);
-    _gum_v8_process_realize (&self->process);
     _gum_v8_thread_realize (&self->thread);
+    _gum_v8_process_realize (&self->process);
     _gum_v8_file_realize (&self->file);
     _gum_v8_checksum_realize (&self->checksum);
     _gum_v8_stream_realize (&self->stream);
@@ -569,6 +575,9 @@ gum_v8_script_create_context (GumV8Script * self,
     _gum_v8_code_writer_realize (&self->code_writer);
     _gum_v8_code_relocator_realize (&self->code_relocator);
     _gum_v8_stalker_realize (&self->stalker);
+    _gum_v8_cloak_realize (&self->cloak);
+    _gum_v8_sampler_realize (&self->sampler);
+    _gum_v8_profiler_realize (&self->profiler);
 
     self->program = gum_v8_script_compile (self, isolate, context, error);
   }
@@ -650,7 +659,8 @@ gum_v8_script_compile (GumV8Script * self,
           const gchar * alias_start = rest_end + std::strlen (alias_marker);
           const gchar * alias_end = std::strchr (alias_start, '\n');
 
-          gchar * asset_alias = g_strndup (alias_start, alias_end - alias_start);
+          gchar * asset_alias =
+              g_strndup (alias_start, alias_end - alias_start);
           if (g_hash_table_contains (program->es_assets, asset_alias))
           {
             g_free (asset_alias);
@@ -1098,6 +1108,9 @@ gum_v8_script_destroy_context (GumV8Script * self)
   {
     ScriptScope scope (self);
 
+    _gum_v8_profiler_dispose (&self->profiler);
+    _gum_v8_sampler_dispose (&self->sampler);
+    _gum_v8_cloak_dispose (&self->cloak);
     _gum_v8_stalker_dispose (&self->stalker);
     _gum_v8_code_relocator_dispose (&self->code_relocator);
     _gum_v8_code_writer_dispose (&self->code_writer);
@@ -1113,8 +1126,8 @@ gum_v8_script_destroy_context (GumV8Script * self)
     _gum_v8_stream_dispose (&self->stream);
     _gum_v8_checksum_dispose (&self->checksum);
     _gum_v8_file_dispose (&self->file);
-    _gum_v8_thread_dispose (&self->thread);
     _gum_v8_process_dispose (&self->process);
+    _gum_v8_thread_dispose (&self->thread);
     _gum_v8_module_dispose (&self->module);
     _gum_v8_memory_dispose (&self->memory);
     _gum_v8_kernel_dispose (&self->kernel);
@@ -1130,6 +1143,9 @@ gum_v8_script_destroy_context (GumV8Script * self)
   delete self->context;
   self->context = nullptr;
 
+  _gum_v8_profiler_finalize (&self->profiler);
+  _gum_v8_sampler_finalize (&self->sampler);
+  _gum_v8_cloak_finalize (&self->cloak);
   _gum_v8_stalker_finalize (&self->stalker);
   _gum_v8_code_relocator_finalize (&self->code_relocator);
   _gum_v8_code_writer_finalize (&self->code_writer);
@@ -1145,8 +1161,8 @@ gum_v8_script_destroy_context (GumV8Script * self)
   _gum_v8_stream_finalize (&self->stream);
   _gum_v8_checksum_finalize (&self->checksum);
   _gum_v8_file_finalize (&self->file);
-  _gum_v8_thread_finalize (&self->thread);
   _gum_v8_process_finalize (&self->process);
+  _gum_v8_thread_finalize (&self->thread);
   _gum_v8_module_finalize (&self->module);
   _gum_v8_memory_finalize (&self->memory);
   _gum_v8_kernel_finalize (&self->kernel);
@@ -1287,6 +1303,7 @@ gum_v8_script_on_entrypoints_executed (const FunctionCallbackInfo<Value> & info)
   auto task = (GumScriptTask *) info.Data ().As<External> ()->Value ();
   auto self = (GumV8Script *)
       g_async_result_get_source_object (G_ASYNC_RESULT (task));
+  auto core = &self->core;
   auto isolate = info.GetIsolate ();
   auto context = isolate->GetCurrentContext ();
 
@@ -1298,7 +1315,31 @@ gum_v8_script_on_entrypoints_executed (const FunctionCallbackInfo<Value> & info)
     auto value = values->Get (context, i).ToLocalChecked ().As<Object> ();
     auto reason = value->Get (context, reason_str).ToLocalChecked ();
     if (!reason->IsUndefined ())
-      _gum_v8_core_on_unhandled_exception (&self->core, reason);
+      _gum_v8_core_on_unhandled_exception (core, reason);
+  }
+
+  auto source = g_idle_source_new ();
+  g_source_set_callback (source, (GSourceFunc) gum_v8_script_complete_load_task,
+      task, g_object_unref);
+  g_source_attach (source,
+      gum_script_scheduler_get_js_context (core->scheduler));
+  g_source_unref (source);
+
+  _gum_v8_core_pin (core);
+
+  g_object_unref (self);
+}
+
+static gboolean
+gum_v8_script_complete_load_task (GumScriptTask * task)
+{
+  auto self = GUM_V8_SCRIPT (
+      g_async_result_get_source_object (G_ASYNC_RESULT (task)));
+
+  {
+    ScriptScope scope (self);
+
+    _gum_v8_core_unpin (&self->core);
   }
 
   self->state = GUM_SCRIPT_STATE_LOADED;
@@ -1306,7 +1347,8 @@ gum_v8_script_on_entrypoints_executed (const FunctionCallbackInfo<Value> & info)
   gum_script_task_return_pointer (task, NULL, NULL);
 
   g_object_unref (self);
-  g_object_unref (task);
+
+  return G_SOURCE_REMOVE;
 }
 
 static void
@@ -1390,6 +1432,8 @@ gum_v8_script_try_unload (GumV8Script * self)
   {
     ScriptScope scope (self);
 
+    _gum_v8_profiler_flush (&self->profiler);
+    _gum_v8_sampler_flush (&self->sampler);
     _gum_v8_stalker_flush (&self->stalker);
     _gum_v8_interceptor_flush (&self->interceptor);
     _gum_v8_socket_flush (&self->socket);

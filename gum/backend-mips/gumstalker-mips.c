@@ -1,10 +1,12 @@
 /*
- * Copyright (C) 2009-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2009-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
 
 #include "gumstalker.h"
+
+#include "gumstalker-priv.h"
 
 struct _GumStalker
 {
@@ -183,6 +185,15 @@ gum_stalker_remove_call_probe (GumStalker * self,
 {
 }
 
+void
+_gum_stalker_modify_to_run_on_thread (GumStalker * self,
+                                      GumThreadId thread_id,
+                                      GumCpuContext * cpu_context,
+                                      GumStalkerRunOnThreadFunc func,
+                                      gpointer data)
+{
+}
+
 gboolean
 gum_stalker_iterator_next (GumStalkerIterator * self,
                            const cs_insn ** insn)
@@ -195,10 +206,27 @@ gum_stalker_iterator_keep (GumStalkerIterator * self)
 {
 }
 
+GumMemoryAccess
+gum_stalker_iterator_get_memory_access (GumStalkerIterator * self)
+{
+  return GUM_MEMORY_ACCESS_OPEN;
+}
+
 void
 gum_stalker_iterator_put_callout (GumStalkerIterator * self,
                                   GumStalkerCallout callout,
                                   gpointer data,
                                   GDestroyNotify data_destroy)
 {
+}
+
+void
+gum_stalker_iterator_put_chaining_return (GumStalkerIterator * self)
+{
+}
+
+csh
+gum_stalker_iterator_get_capstone (GumStalkerIterator * self)
+{
+  return 0;
 }

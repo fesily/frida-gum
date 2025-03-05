@@ -1,10 +1,11 @@
 /*
- * Copyright (C) 2010-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2010-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2015 Asger Hautop Drewsen <asgerdrewsen@gmail.com>
  * Copyright (C) 2015 Marc Hartmayer <hello@hartmayer.com>
  * Copyright (C) 2020-2022 Francesco Tamagni <mrmacete@protonmail.ch>
  * Copyright (C) 2020 Marcus Mengs <mame8282@googlemail.com>
  * Copyright (C) 2021 Abdelrahman Eid <hot3eed@gmail.com>
+ * Copyright (C) 2024 Simon Zuckerbraun <Simon_Zuckerbraun@trendmicro.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -26,6 +27,7 @@
 # include "gumv8script-java.h"
 #endif
 
+#include <ffi.h>
 #include <glib/gprintf.h>
 #ifdef _MSC_VER
 # include <intrin.h>
@@ -139,10 +141,27 @@ struct GumV8NativeFunction
   GumV8Core * core;
 };
 
+struct GumV8NativeCallback
+{
+  gint ref_count;
+
+  v8::Global<v8::Object> * wrapper;
+  gpointer ptr_value;
+
+  v8::Global<v8::Function> * func;
+  ffi_closure * closure;
+  ffi_cif cif;
+  ffi_type ** atypes;
+  GSList * data;
+
+  GumV8Core * core;
+};
+
 struct GumV8CallbackContext
 {
   Global<Object> * wrapper;
   Global<Object> * cpu_context;
+  gint * system_error;
   GumAddress return_address;
   GumAddress raw_return_address;
 };
@@ -308,11 +327,13 @@ static void gum_v8_native_callback_invoke (ffi_cif * cif,
     void * return_value, void ** args, void * user_data);
 
 static GumV8CallbackContext * gum_v8_callback_context_new_persistent (
-    GumV8Core * core, GumCpuContext * cpu_context,
+    GumV8Core * core, GumCpuContext * cpu_context, gint * system_error,
     GumAddress raw_return_address);
 static void gum_v8_callback_context_free (GumV8CallbackContext * self);
 GUMJS_DECLARE_GETTER (gumjs_callback_context_get_return_address)
 GUMJS_DECLARE_GETTER (gumjs_callback_context_get_cpu_context)
+GUMJS_DECLARE_GETTER (gumjs_callback_context_get_system_error)
+GUMJS_DECLARE_SETTER (gumjs_callback_context_set_system_error)
 
 GUMJS_DECLARE_CONSTRUCTOR (gumjs_cpu_context_construct)
 GUMJS_DECLARE_GETTER (gumjs_cpu_context_get_gpr)
@@ -482,8 +503,21 @@ static const GumV8Function gumjs_native_function_functions[] =
 
 static const GumV8Property gumjs_callback_context_values[] =
 {
-  { "returnAddress", gumjs_callback_context_get_return_address, NULL },
-  { "context", gumjs_callback_context_get_cpu_context, NULL },
+  {
+    "returnAddress",
+    gumjs_callback_context_get_return_address,
+    NULL
+  },
+  {
+    "context",
+    gumjs_callback_context_get_cpu_context,
+    NULL
+  },
+  {
+    GUMJS_SYSTEM_ERROR_FIELD,
+    gumjs_callback_context_get_system_error,
+    gumjs_callback_context_set_system_error
+  },
 
   { NULL, NULL, NULL }
 };
@@ -597,8 +631,6 @@ _gum_v8_core_init (GumV8Core * self,
       gumjs_native_callback_construct, scope, module, isolate);
   native_callback->Inherit (native_pointer);
   native_callback->InstanceTemplate ()->SetInternalFieldCount (2);
-  self->native_callback =
-      new Global<FunctionTemplate> (isolate, native_callback);
 
   auto cc = _gum_v8_create_class ("CallbackContext", nullptr, scope,
       module, isolate);
@@ -1291,9 +1323,6 @@ _gum_v8_core_finalize (GumV8Core * self)
   delete self->callback_context;
   self->callback_context = nullptr;
 
-  delete self->native_callback;
-  self->native_callback = nullptr;
-
   delete self->native_function;
   self->native_function = nullptr;
 
@@ -1573,6 +1602,10 @@ GUMJS_DEFINE_FUNCTION (gumjs_set_incoming_message_callback)
 
 GUMJS_DEFINE_FUNCTION (gumjs_wait_for_event)
 {
+  g_mutex_lock (&core->event_mutex);
+  auto start_count = core->event_count;
+  g_mutex_unlock (&core->event_mutex);
+
   gboolean event_source_available;
 
   core->current_scope->PerformPendingIO ();
@@ -1585,7 +1618,6 @@ GUMJS_DEFINE_FUNCTION (gumjs_wait_for_event)
 
     g_mutex_lock (&core->event_mutex);
 
-    auto start_count = core->event_count;
     while (core->event_count == start_count && core->event_source_available)
     {
       if (called_from_js_thread)
@@ -2146,7 +2178,8 @@ GUMJS_DEFINE_FUNCTION (gumjs_int64_to_string)
 GUMJS_DEFINE_FUNCTION (gumjs_int64_to_json)
 {
   gchar str[32];
-  g_sprintf (str, "%" G_GINT64_FORMAT, _gum_v8_int64_get_value (info.Holder ()));
+  g_sprintf (str, "%" G_GINT64_FORMAT,
+      _gum_v8_int64_get_value (info.Holder ()));
 
   info.GetReturnValue ().Set (_gum_v8_string_new_ascii (isolate, str));
 }
@@ -3371,6 +3404,7 @@ GUMJS_DEFINE_CONSTRUCTOR (gumjs_native_callback_construct)
   callback->wrapper = new Global<Object> (isolate, wrapper);
   callback->wrapper->SetWeak (callback,
       gum_v8_native_callback_on_weak_notify, WeakCallbackType::kParameter);
+  callback->ptr_value = func;
 
   g_hash_table_add (core->native_callbacks, callback);
 
@@ -3433,10 +3467,11 @@ gum_v8_native_callback_invoke (ffi_cif * cif,
                                void ** args,
                                void * user_data)
 {
+  GumV8SystemErrorPreservationScope error_scope;
   guintptr return_address = 0;
   guintptr stack_pointer = 0;
   guintptr frame_pointer = 0;
-#if defined (HAVE_I386) && defined (_MSC_VER)
+#if defined (_MSC_VER)
   return_address = GPOINTER_TO_SIZE (_ReturnAddress ());
   stack_pointer = GPOINTER_TO_SIZE (_AddressOfReturnAddress ());
   frame_pointer = *((guintptr *) stack_pointer - 1);
@@ -3504,8 +3539,9 @@ gum_v8_native_callback_invoke (ffi_cif * cif,
   auto interceptor = &self->core->script->interceptor;
   GumV8InvocationContext * jic = NULL;
   GumV8CallbackContext * jcc = NULL;
-  auto ic = gum_interceptor_get_current_invocation ();
-  if (ic != NULL && self->interceptor_replacement_count > 0)
+  GumCpuContext cpu_context = { 0, };
+  auto ic = gum_interceptor_get_live_replacement_invocation (self->ptr_value);
+  if (ic != NULL)
   {
     jic = _gum_v8_interceptor_obtain_invocation_context (interceptor);
     _gum_v8_invocation_context_reset (jic, ic);
@@ -3513,7 +3549,6 @@ gum_v8_native_callback_invoke (ffi_cif * cif,
   }
   else
   {
-    GumCpuContext cpu_context = { 0, };
 #if defined (HAVE_I386)
     GUM_CPU_CONTEXT_XSP (&cpu_context) = stack_pointer;
     GUM_CPU_CONTEXT_XBP (&cpu_context) = frame_pointer;
@@ -3528,7 +3563,7 @@ gum_v8_native_callback_invoke (ffi_cif * cif,
 #endif
 
     jcc = gum_v8_callback_context_new_persistent (self->core, &cpu_context,
-        return_address);
+        &error_scope.saved_error, return_address);
     recv = Local<Object>::New (isolate, *jcc->wrapper);
   }
 
@@ -3564,6 +3599,7 @@ gum_v8_native_callback_invoke (ffi_cif * cif,
 static GumV8CallbackContext *
 gum_v8_callback_context_new_persistent (GumV8Core * core,
                                         GumCpuContext * cpu_context,
+                                        gint * system_error,
                                         GumAddress raw_return_address)
 {
   auto isolate = core->isolate;
@@ -3574,12 +3610,13 @@ gum_v8_callback_context_new_persistent (GumV8Core * core,
       *core->callback_context_value);
   auto wrapper = callback_context_value->Clone ();
   wrapper->SetAlignedPointerInInternalField (0, jcc);
-  jcc->wrapper = new Global<Object> (isolate, wrapper);
-  jcc->return_address = 0;
-  jcc->raw_return_address = raw_return_address;
 
+  jcc->wrapper = new Global<Object> (isolate, wrapper);
   jcc->cpu_context = new Global<Object> (isolate,
       _gum_v8_cpu_context_new_immutable (cpu_context, core));
+  jcc->system_error = system_error;
+  jcc->return_address = 0;
+  jcc->raw_return_address = raw_return_address;
 
   return jcc;
 }
@@ -3635,6 +3672,22 @@ GUMJS_DEFINE_CLASS_GETTER (gumjs_callback_context_get_cpu_context,
   }
 
   info.GetReturnValue ().Set (Local<Object>::New (isolate, *context));
+}
+
+GUMJS_DEFINE_CLASS_GETTER (gumjs_callback_context_get_system_error,
+                           GumV8CallbackContext)
+{
+  info.GetReturnValue ().Set (*self->system_error);
+}
+
+GUMJS_DEFINE_CLASS_SETTER (gumjs_callback_context_set_system_error,
+                           GumV8CallbackContext)
+{
+  gint system_error;
+  if (!_gum_v8_int_get (value, &system_error, core))
+    return;
+
+  *self->system_error = system_error;
 }
 
 GUMJS_DEFINE_CONSTRUCTOR (gumjs_cpu_context_construct)
@@ -3729,7 +3782,6 @@ gumjs_cpu_context_set_vector (Local<Name> property,
   GBytes * new_bytes = _gum_v8_bytes_get (value, core);
   if (new_bytes == NULL)
     return;
-
 
   gsize new_size;
   gconstpointer new_data = g_bytes_get_data (new_bytes, &new_size);
@@ -3867,7 +3919,7 @@ gumjs_cpu_context_set_flags (Local<Name> property,
 
 GUMJS_DEFINE_CONSTRUCTOR (gumjs_match_pattern_construct)
 {
-  if (!info.IsConstructCall())
+  if (!info.IsConstructCall ())
   {
     _gum_v8_throw_ascii_literal (isolate,
         "use `new MatchPattern()` to create a new instance");

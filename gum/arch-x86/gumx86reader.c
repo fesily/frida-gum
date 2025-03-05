@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2009-2019 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2009-2023 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -52,6 +52,42 @@ gum_x86_reader_insn_is_jcc (const cs_insn * insn)
   }
 
   return FALSE;
+}
+
+gpointer
+gum_x86_reader_find_next_call_target (gconstpointer address)
+{
+  gpointer result = NULL;
+  csh capstone;
+  const uint8_t * code;
+  size_t size;
+  cs_insn * insn;
+  uint64_t addr;
+
+  cs_arch_register_x86 ();
+  cs_open (CS_ARCH_X86, GUM_CPU_MODE, &capstone);
+  cs_option (capstone, CS_OPT_DETAIL, CS_OPT_ON);
+
+  code = address;
+  size = 1024;
+  addr = GPOINTER_TO_SIZE (address);
+
+  insn = cs_malloc (capstone);
+
+  while (cs_disasm_iter (capstone, &code, &size, &addr, insn))
+  {
+    if (insn->id == X86_INS_CALL)
+    {
+      result = GSIZE_TO_POINTER (insn->detail->x86.operands[0].imm);
+      break;
+    }
+  }
+
+  cs_free (insn, 1);
+
+  cs_close (&capstone);
+
+  return result;
 }
 
 gpointer
@@ -123,6 +159,7 @@ gum_x86_reader_disassemble_instruction_at (gconstpointer address)
   csh capstone;
   cs_insn * insn = NULL;
 
+  cs_arch_register_x86 ();
   cs_open (CS_ARCH_X86, GUM_CPU_MODE, &capstone);
   cs_option (capstone, CS_OPT_DETAIL, CS_OPT_ON);
 

@@ -1,12 +1,14 @@
 /*
- * Copyright (C) 2014-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2014-2025 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2017 Antonio Ken Iannillo <ak.iannillo@gmail.com>
  * Copyright (C) 2019 John Coates <john@johncoates.dev>
+ * Copyright (C) 2023 Håvard Sørbø <havard@hsorbo.no>
+ * Copyright (C) 2024 Francesco Tamagni <mrmacete@protonmail.ch>
+ * Copyright (C) 2024 Alex Soler <asoler@nowsecure.com>
+ * Copyright (C) 2024 Sai Cao <1665673333@qq.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
-
-#ifndef GUM_DIET
 
 #include "gumstalker.h"
 
@@ -17,6 +19,7 @@
 #include "gummemory.h"
 #include "gummetalhash.h"
 #include "gumspinlock.h"
+#include "gumstalker-priv.h"
 #ifdef HAVE_LINUX
 # include "gum-init.h"
 # include "guminterceptor.h"
@@ -24,7 +27,6 @@
 
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 #ifdef HAVE_LINUX
 # include <unwind.h>
 # include <sys/syscall.h>
@@ -43,6 +45,7 @@
 #define GUM_STACK_ALIGNMENT                16
 #define GUM_INVALIDATE_TRAMPOLINE_MAX_SIZE 40
 #define GUM_RESTORATION_PROLOG_SIZE        4
+#define GUM_EXCLUSIVE_ACCESS_MAX_DEPTH     8
 
 #define GUM_IC_MAGIC_EMPTY                 0xbaadd00ddeadface
 
@@ -297,7 +300,10 @@ struct _GumExecBlock
 
 enum _GumExecBlockFlags
 {
-  GUM_EXEC_BLOCK_ACTIVATION_TARGET = 1 << 0,
+  GUM_EXEC_BLOCK_ACTIVATION_TARGET     = 1 << 0,
+  GUM_EXEC_BLOCK_HAS_EXCLUSIVE_LOAD    = 1 << 1,
+  GUM_EXEC_BLOCK_HAS_EXCLUSIVE_STORE   = 1 << 2,
+  GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS = 1 << 3,
 };
 
 struct _GumSlab
@@ -349,7 +355,6 @@ struct _GumGeneratorContext
   GumArm64Writer * slow_writer;
   gpointer continuation_real_address;
   GumPrologType opened_prolog;
-  gint exclusive_load_offset;
 };
 
 struct _GumInstruction
@@ -402,7 +407,6 @@ enum _GumVirtualizationRequirements
 {
   GUM_REQUIRE_NOTHING          = 0,
   GUM_REQUIRE_RELOCATION       = 1 << 0,
-  GUM_REQUIRE_EXCLUSIVE_STORE  = 1 << 1,
 };
 
 enum _GumBackpatchType
@@ -686,10 +690,16 @@ static void gum_exec_block_write_jmp_transfer_code (GumExecBlock * block,
     GumGeneratorContext * gc);
 static void gum_exec_block_write_ret_transfer_code (GumExecBlock * block,
     GumGeneratorContext * gc, arm64_reg ret_reg);
+static void gum_exec_block_write_chaining_return_code (GumExecBlock * block,
+    GumGeneratorContext * gc, arm64_reg ret_reg);
 static void gum_exec_block_write_slab_transfer_code (GumArm64Writer * from,
     GumArm64Writer * to);
 static void gum_exec_block_backpatch_slab (GumExecBlock * block,
     gpointer target);
+static void gum_exec_block_maybe_inherit_exclusive_access_state (
+    GumExecBlock * block, GumExecBlock * reference);
+static void gum_exec_block_propagate_exclusive_access_state (
+    GumExecBlock * block);
 static void gum_exec_ctx_write_adjust_depth (GumExecCtx * ctx,
     GumArm64Writer * cw, gssize adj);
 static arm64_reg gum_exec_block_write_inline_cache_code (
@@ -751,8 +761,6 @@ static gpointer gum_slab_reserve (GumSlab * self, gsize size);
 static gpointer gum_slab_try_reserve (GumSlab * self, gsize size);
 
 static gpointer gum_find_thread_exit_implementation (void);
-
-static gboolean gum_is_bl_imm (guint32 insn) G_GNUC_UNUSED;
 
 G_DEFINE_TYPE (GumStalker, gum_stalker, G_TYPE_OBJECT)
 
@@ -1283,7 +1291,7 @@ _gum_stalker_do_follow_me (GumStalker * self,
   gum_event_sink_start (ctx->sink);
   ctx->sink_started = TRUE;
 
-  return code_address + GUM_RESTORATION_PROLOG_SIZE;
+  return (guint8 *) code_address + GUM_RESTORATION_PROLOG_SIZE;
 }
 
 void
@@ -1329,7 +1337,8 @@ gum_stalker_follow (GumStalker * self,
     ctx.transformer = transformer;
     ctx.sink = sink;
 
-    gum_process_modify_thread (thread_id, gum_stalker_infect, &ctx);
+    gum_process_modify_thread (thread_id, gum_stalker_infect, &ctx,
+        GUM_MODIFY_THREAD_FLAGS_NONE);
   }
 }
 
@@ -1360,7 +1369,8 @@ gum_stalker_unfollow (GumStalker * self,
       dc.exec_ctx = ctx;
       dc.success = FALSE;
 
-      gum_process_modify_thread (thread_id, gum_stalker_disinfect, &dc);
+      gum_process_modify_thread (thread_id, gum_stalker_disinfect, &dc,
+          GUM_MODIFY_THREAD_FLAGS_NONE);
 
       if (dc.success)
         gum_stalker_destroy_exec_ctx (self, ctx);
@@ -1476,7 +1486,7 @@ _gum_stalker_do_activate (GumStalker * self,
     if (gum_exec_ctx_maybe_unfollow (ctx, ret_addr))
       return ret_addr;
 
-    return code_address + GUM_RESTORATION_PROLOG_SIZE;
+    return (guint8 *) code_address + GUM_RESTORATION_PROLOG_SIZE;
   }
 
   return ret_addr;
@@ -1752,7 +1762,8 @@ gum_stalker_do_invalidate (GumExecCtx * ctx,
     else
     {
       gum_process_modify_thread (ctx->thread_id,
-          gum_stalker_try_invalidate_block_owned_by_thread, &ic);
+          gum_stalker_try_invalidate_block_owned_by_thread, &ic,
+          GUM_MODIFY_THREAD_FLAGS_NONE);
     }
   }
 
@@ -1914,6 +1925,74 @@ gum_call_probe_unref (GumCallProbe * probe)
   {
     gum_call_probe_finalize (probe);
   }
+}
+
+void
+_gum_stalker_modify_to_run_on_thread (GumStalker * self,
+                                      GumThreadId thread_id,
+                                      GumCpuContext * cpu_context,
+                                      GumStalkerRunOnThreadFunc func,
+                                      gpointer data)
+{
+  GumExecCtx * ctx;
+  GumAddress pc;
+  GumArm64Writer * cw;
+  GumAddress cpu_context_copy;
+
+  ctx = gum_stalker_create_exec_ctx (self, thread_id, NULL, NULL);
+
+  pc = gum_strip_code_address (cpu_context->pc);
+
+  gum_spinlock_acquire (&ctx->code_lock);
+
+  gum_stalker_thaw (self, ctx->thunks, self->thunks_size);
+  cw = &ctx->code_writer;
+  gum_arm64_writer_reset (cw, ctx->infect_thunk);
+
+  cpu_context_copy = GUM_ADDRESS (gum_arm64_writer_cur (cw));
+  gum_arm64_writer_put_bytes (cw, (guint8 *) cpu_context,
+      sizeof (GumCpuContext));
+
+  ctx->infect_body = GUM_ADDRESS (gum_arm64_writer_cur (cw));
+
+#ifdef HAVE_PTRAUTH
+  ctx->infect_body = GPOINTER_TO_SIZE (ptrauth_sign_unauthenticated (
+      GSIZE_TO_POINTER (ctx->infect_body),
+      ptrauth_key_process_independent_code,
+      ptrauth_string_discriminator ("pc")));
+#endif
+  gum_exec_ctx_write_prolog (ctx, GUM_PROLOG_MINIMAL, cw);
+
+  gum_arm64_writer_put_call_address_with_arguments (cw,
+      GUM_ADDRESS (func), 2,
+      GUM_ARG_ADDRESS, cpu_context_copy,
+      GUM_ARG_ADDRESS, GUM_ADDRESS (data));
+
+  gum_arm64_writer_put_call_address_with_arguments (cw,
+      GUM_ADDRESS (gum_exec_ctx_unfollow), 2,
+      GUM_ARG_ADDRESS, GUM_ADDRESS (ctx),
+      GUM_ARG_ADDRESS, pc);
+
+  gum_exec_ctx_write_epilog (ctx, GUM_PROLOG_MINIMAL, cw);
+
+  /*
+   * Here we spoil x17 since this is a necessity of the AARCH64 architecture
+   * when performing long branches. However, the documentation states...
+   *
+   * "Registers r16 (IP0) and r17 (IP1) may be used by a linker as a scratch
+   *  register between a routine and any subroutine it calls."
+   *
+   * This same approach is used elsewhere in Stalker for arm64.
+   */
+  gum_arm64_writer_put_ldr_reg_address (cw, ARM64_REG_X17, pc);
+  gum_arm64_writer_put_br_reg_no_auth (cw, ARM64_REG_X17);
+
+  gum_arm64_writer_flush (cw);
+  gum_stalker_freeze (self, cw->base, gum_arm64_writer_offset (cw));
+
+  gum_spinlock_release (&ctx->code_lock);
+
+  cpu_context->pc = ctx->infect_body;
 }
 
 static GumExecCtx *
@@ -2123,8 +2202,6 @@ gum_exec_ctx_new (GumStalker * stalker,
   ctx->mappings = gum_metal_hash_table_new (NULL, NULL);
 
   gum_exec_ctx_ensure_inline_helpers_reachable (ctx);
-
-  code_slab->invalidator = ctx->last_invalidator;
 
   ctx->depth = 0;
 
@@ -2527,10 +2604,12 @@ gum_exec_ctx_obtain_block_for (GumExecCtx * ctx,
   {
     block = gum_exec_block_new (ctx);
     block->real_start = real_address;
+    gum_exec_block_maybe_inherit_exclusive_access_state (block, block->next);
     gum_exec_ctx_compile_block (ctx, block, real_address, block->code_start,
         GUM_ADDRESS (block->code_start), &block->real_size, &block->code_size,
         &block->slow_size);
     gum_exec_block_commit (block);
+    gum_exec_block_propagate_exclusive_access_state (block);
 
     gum_metal_hash_table_insert (ctx->mappings, real_address, block);
 
@@ -2665,6 +2744,7 @@ gum_exec_ctx_write_scratch_slab (GumExecCtx * ctx,
   block->slow_slab = ctx->slow_slab;
   block->slow_start = gum_slab_cursor (&slow_slab->slab);
   scratch_base = ctx->scratch_slab->slab.data;
+  ctx->scratch_slab->invalidator = prev_code_slab->invalidator;
 
   gum_exec_ctx_compile_block (ctx, block, block->real_start, scratch_base,
       GUM_ADDRESS (internal_code), input_size, output_size, slow_size);
@@ -2710,7 +2790,6 @@ gum_exec_ctx_compile_block (GumExecCtx * ctx,
   gc.slow_writer = cws;
   gc.continuation_real_address = NULL;
   gc.opened_prolog = GUM_PROLOG_NONE;
-  gc.exclusive_load_offset = GUM_INSTRUCTION_OFFSET_NONE;
 
   iterator.exec_context = ctx;
   iterator.exec_block = block;
@@ -2802,34 +2881,9 @@ gum_stalker_iterator_next (GumStalkerIterator * self,
       gc->continuation_real_address = instruction->end;
       return FALSE;
     }
-    else if ((self->requirements & GUM_REQUIRE_EXCLUSIVE_STORE) == 0 &&
-        gum_arm64_relocator_eob (rl))
-    {
+
+    if (!skip_implicitly_requested && gum_arm64_relocator_eob (rl))
       return FALSE;
-    }
-
-    switch (instruction->ci->id)
-    {
-      case ARM64_INS_STXR:
-      case ARM64_INS_STXP:
-      case ARM64_INS_STXRB:
-      case ARM64_INS_STXRH:
-      case ARM64_INS_STLXR:
-      case ARM64_INS_STLXP:
-      case ARM64_INS_STLXRB:
-      case ARM64_INS_STLXRH:
-        gc->exclusive_load_offset = GUM_INSTRUCTION_OFFSET_NONE;
-        break;
-      default:
-        break;
-    }
-
-    if (gc->exclusive_load_offset != GUM_INSTRUCTION_OFFSET_NONE)
-    {
-      gc->exclusive_load_offset++;
-      if (gc->exclusive_load_offset == 4)
-        gc->exclusive_load_offset = GUM_INSTRUCTION_OFFSET_NONE;
-    }
   }
 
   instruction = &self->instruction;
@@ -2843,7 +2897,9 @@ gum_stalker_iterator_next (GumStalkerIterator * self,
 
   self->generator_context->instruction = instruction;
 
-  if (is_first_instruction && (self->exec_context->sink_mask & GUM_BLOCK) != 0)
+  if (is_first_instruction &&
+     (self->exec_context->sink_mask & GUM_BLOCK) != 0 &&
+     (self->exec_block->flags & GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS) == 0)
   {
     gum_exec_block_write_block_event_code (self->exec_block, gc,
         GUM_CODE_INTERRUPTIBLE);
@@ -2893,14 +2949,24 @@ gum_stalker_iterator_keep (GumStalkerIterator * self)
     case ARM64_INS_LDXP:
     case ARM64_INS_LDXRB:
     case ARM64_INS_LDXRH:
-      gc->exclusive_load_offset = 0;
+      block->flags |= GUM_EXEC_BLOCK_HAS_EXCLUSIVE_LOAD;
+      break;
+    case ARM64_INS_STXR:
+    case ARM64_INS_STXP:
+    case ARM64_INS_STXRB:
+    case ARM64_INS_STXRH:
+    case ARM64_INS_STLXR:
+    case ARM64_INS_STLXP:
+    case ARM64_INS_STLXRB:
+    case ARM64_INS_STLXRH:
+      block->flags |= GUM_EXEC_BLOCK_HAS_EXCLUSIVE_STORE;
       break;
     default:
       break;
   }
 
   if ((self->exec_context->sink_mask & GUM_EXEC) != 0 &&
-      gc->exclusive_load_offset == GUM_INSTRUCTION_OFFSET_NONE)
+      (block->flags & GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS) == 0)
   {
     gum_exec_block_write_exec_event_code (block, gc, GUM_CODE_INTERRUPTIBLE);
   }
@@ -2947,6 +3013,14 @@ gum_stalker_iterator_keep (GumStalkerIterator * self)
     gum_arm64_relocator_write_one (rl);
 
   self->requirements = requirements;
+}
+
+GumMemoryAccess
+gum_stalker_iterator_get_memory_access (GumStalkerIterator * self)
+{
+  return ((self->exec_block->flags & GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS) != 0)
+      ? GUM_MEMORY_ACCESS_EXCLUSIVE
+      : GUM_MEMORY_ACCESS_OPEN;
 }
 
 static void
@@ -3068,6 +3142,24 @@ gum_stalker_invoke_callout (GumCalloutEntry * entry,
   ec->pending_calls--;
 }
 
+void
+gum_stalker_iterator_put_chaining_return (GumStalkerIterator * self)
+{
+  GumExecBlock * block = self->exec_block;
+  GumGeneratorContext * gc = self->generator_context;
+
+  if ((block->ctx->sink_mask & GUM_RET) != 0)
+    gum_exec_block_write_ret_event_code (block, gc, GUM_CODE_INTERRUPTIBLE);
+
+  gum_exec_block_write_chaining_return_code (block, gc, ARM64_REG_X30);
+}
+
+csh
+gum_stalker_iterator_get_capstone (GumStalkerIterator * self)
+{
+  return self->exec_context->relocator.capstone;
+}
+
 /*
  * Note that as well as providing a GumArm64Writer to the functions for writing
  * a prolog or epilog, we must also provide a parameter indicating whether it is
@@ -3131,6 +3223,8 @@ gum_exec_ctx_ensure_inline_helpers_reachable (GumExecCtx * ctx)
 
   gum_exec_ctx_ensure_helper_reachable (ctx, code_slab, slow_slab, cw,
       &ctx->last_invalidator, gum_exec_ctx_write_invalidator);
+  ctx->code_slab->invalidator = ctx->last_invalidator;
+  ctx->slow_slab->invalidator = ctx->last_invalidator;
 }
 
 static void
@@ -3759,10 +3853,11 @@ static guint64
 gum_exec_ctx_read_register (GumCpuContext * cpu_context,
                             arm64_reg reg)
 {
+  if (reg >= ARM64_REG_X0 && reg <= ARM64_REG_X28)
+    return cpu_context->x[reg - ARM64_REG_X0];
+
   switch (reg)
   {
-    case ARM64_REG_X0...ARM64_REG_X28:
-      return cpu_context->x[reg - ARM64_REG_X0];
     case ARM64_REG_X29:
       return cpu_context->fp;
     case ARM64_REG_X30:
@@ -3777,11 +3872,14 @@ gum_exec_ctx_write_register (GumCpuContext * cpu_context,
                              arm64_reg reg,
                              guint64 value)
 {
+  if (reg >= ARM64_REG_X0 && reg <= ARM64_REG_X28)
+  {
+    cpu_context->x[reg - ARM64_REG_X0] = value;
+    return;
+  }
+
   switch (reg)
   {
-    case ARM64_REG_X0...ARM64_REG_X28:
-      cpu_context->x[reg - ARM64_REG_X0] = value;
-      break;
     case ARM64_REG_X29:
       cpu_context->fp = value;
       break;
@@ -4372,15 +4470,8 @@ gum_exec_block_virtualize_branch_insn (GumExecBlock * block,
 
         gum_arm64_writer_put_label (cw, is_false);
 
-        if (gc->exclusive_load_offset == GUM_INSTRUCTION_OFFSET_NONE)
-        {
-          gum_exec_block_write_jmp_transfer_code (block, &cond_target,
-              cond_entry_func, gc);
-        }
-        else
-        {
-          return GUM_REQUIRE_EXCLUSIVE_STORE;
-        }
+        gum_exec_block_write_jmp_transfer_code (block, &cond_target,
+            cond_entry_func, gc);
       }
 
       break;
@@ -4791,10 +4882,7 @@ gum_exec_block_write_call_invoke_code (GumExecBlock * block,
      * therefore don't have to strip the low bit from the target address
      * returned from the inline cache code.
      */
-    if (gc->instruction->ci->id == ARM64_INS_BLR)
-      gum_arm64_writer_put_blr_reg_no_auth (cw, target->reg);
-    else
-      gum_arm64_writer_put_blr_reg (cw, target->reg);
+    gum_arm64_writer_put_bytes (cw, insn->start, insn->ci->size);
 
 #ifdef HAVE_LINUX
     gum_metal_hash_table_insert (ctx->excluded_calls, cw->code, insn->end);
@@ -4895,7 +4983,7 @@ gum_exec_block_backpatch_excluded_call (GumExecBlock * block,
       (num_ic_entries - 1) * sizeof (GumIcEntry));
 
   ic_entries[0].real_start = target;
-  ic_entries[0].code_start = target + 1;
+  ic_entries[0].code_start = (guint8 *) target + 1;
 
   gum_spinlock_release (&ctx->code_lock);
 
@@ -5017,6 +5105,14 @@ static void
 gum_exec_block_write_ret_transfer_code (GumExecBlock * block,
                                         GumGeneratorContext * gc,
                                         arm64_reg ret_reg)
+{
+  gum_exec_block_write_chaining_return_code (block, gc, ret_reg);
+}
+
+static void
+gum_exec_block_write_chaining_return_code (GumExecBlock * block,
+                                           GumGeneratorContext  * gc,
+                                           arm64_reg ret_reg)
 {
   GumArm64Writer * cw = gc->code_writer;
   GumArm64Writer * cws = gc->slow_writer;
@@ -5191,6 +5287,63 @@ gum_exec_block_backpatch_slab (GumExecBlock * block,
 }
 
 static void
+gum_exec_block_maybe_inherit_exclusive_access_state (GumExecBlock * block,
+                                                     GumExecBlock * reference)
+{
+  const guint8 * real_address = block->real_start;
+  GumExecBlock * cur;
+
+  for (cur = reference; cur != NULL; cur = cur->next)
+  {
+    if ((cur->flags & GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS) == 0)
+      return;
+
+    if (real_address >= cur->real_start &&
+        real_address < cur->real_start + cur->real_size)
+    {
+      block->flags |= GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS;
+      return;
+    }
+  }
+}
+
+static void
+gum_exec_block_propagate_exclusive_access_state (GumExecBlock * block)
+{
+  GumExecBlock * block_containing_load, * cur;
+  guint i;
+
+  if ((block->flags & GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS) != 0)
+    return;
+
+  if ((block->flags & GUM_EXEC_BLOCK_HAS_EXCLUSIVE_STORE) == 0)
+    return;
+
+  block_containing_load = NULL;
+  for (cur = block, i = 0;
+      cur != NULL && i != GUM_EXCLUSIVE_ACCESS_MAX_DEPTH;
+      cur = cur->next, i++)
+  {
+    if ((cur->flags & GUM_EXEC_BLOCK_HAS_EXCLUSIVE_LOAD) != 0)
+    {
+      block_containing_load = cur;
+      break;
+    }
+  }
+  if (block_containing_load == NULL)
+    return;
+
+  for (cur = block; TRUE; cur = cur->next)
+  {
+    cur->flags |= GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS;
+    gum_exec_block_invalidate (cur);
+
+    if (cur == block_containing_load)
+      break;
+  }
+}
+
+static void
 gum_exec_ctx_write_adjust_depth (GumExecCtx * ctx,
                                  GumArm64Writer * cw,
                                  gssize adj)
@@ -5259,7 +5412,7 @@ gum_exec_block_write_inline_cache_code (GumExecBlock * block,
 
   gum_arm64_writer_put_push_reg_reg (cw, ARM64_REG_X0, ARM64_REG_X1);
 
-  if (ARM64_REG_X16 != target_reg)
+  if (target_reg != ARM64_REG_X16)
     gum_arm64_writer_put_mov_reg_reg (cw, ARM64_REG_X16, target_reg);
 
   if ((stalker->cpu_features & GUM_CPU_PTRAUTH) != 0)
@@ -5600,6 +5753,11 @@ gum_code_slab_new (GumExecCtx * ctx)
 
   code_slab = gum_memory_allocate_near (&spec, total_size, stalker->page_size,
       stalker->is_rwx_supported ? GUM_PAGE_RWX : GUM_PAGE_RW);
+  if (code_slab == NULL)
+  {
+    g_error ("Unable to allocate code slab near %p with max_distance=%zu",
+        spec.near_address, spec.max_distance);
+  }
 
   gum_code_slab_init (code_slab, stalker->code_slab_size_dynamic, total_size,
       stalker->page_size);
@@ -5663,6 +5821,11 @@ gum_data_slab_new (GumExecCtx * ctx)
 
   slab = gum_memory_allocate_near (&spec, slab_size, stalker->page_size,
       GUM_PAGE_RW);
+  if (slab == NULL)
+  {
+    g_error ("Unable to allocate data slab near %p with max_distance=%zu",
+        spec.near_address, spec.max_distance);
+  }
 
   gum_data_slab_init (slab, slab_size, slab_size);
 
@@ -5772,55 +5935,28 @@ static gpointer
 gum_find_thread_exit_implementation (void)
 {
 #if defined (HAVE_DARWIN)
-  guint32 * cursor;
-
-  cursor = GSIZE_TO_POINTER (gum_strip_code_address (
-      gum_module_find_export_by_name ("/usr/lib/system/libsystem_pthread.dylib",
-          "pthread_exit")));
-
-  do
-  {
-    guint32 insn = *cursor;
-
-    if (gum_is_bl_imm (insn))
-    {
-      union
-      {
-        gint32 i;
-        guint32 u;
-      } distance;
-
-      distance.u = insn & GUM_INT26_MASK;
-      if ((distance.u & (1 << (26 - 1))) != 0)
-        distance.u |= 0xfc000000;
-
-      return cursor + distance.i;
-    }
-
-    cursor++;
-  }
-  while (TRUE);
+  return gum_arm64_reader_find_next_bl_target (GSIZE_TO_POINTER (
+        gum_strip_code_address (gum_module_find_export_by_name (
+            gum_process_get_libc_module (), "pthread_exit"))));
 #elif defined (HAVE_GLIBC)
   return GSIZE_TO_POINTER (gum_module_find_export_by_name (
-        gum_process_query_libc_name (),
+        gum_process_get_libc_module (),
         "__call_tls_dtors"));
 #elif defined (HAVE_ANDROID)
   return GSIZE_TO_POINTER (gum_module_find_export_by_name (
-        gum_process_query_libc_name (),
+        gum_process_get_libc_module (),
         "pthread_exit"));
 #elif defined (HAVE_FREEBSD)
-  return GSIZE_TO_POINTER (gum_module_find_export_by_name (
-        "/lib/libthr.so.3",
-        "_pthread_exit"));
+  GumAddress result;
+  GumModule * libthr;
+
+  libthr = gum_process_find_module_by_name ("/lib/libthr.so.3");
+  g_assert (libthr != NULL);
+  result = gum_module_find_export_by_name (libthr, "_pthread_exit");
+  g_object_unref (libthr);
+
+  return GSIZE_TO_POINTER (result);
 #else
   return NULL;
 #endif
 }
-
-static gboolean
-gum_is_bl_imm (guint32 insn)
-{
-  return (insn & ~GUM_INT26_MASK) == 0x94000000;
-}
-
-#endif

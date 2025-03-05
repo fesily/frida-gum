@@ -1,5 +1,6 @@
 /*
- * Copyright (C) 2017-2021 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2017-2023 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2024 Francesco Tamagni <mrmacete@protonmail.ch>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -391,13 +392,47 @@ gum_cloak_remove_range_unlocked (const GumMemoryRange * range)
 }
 
 /**
+ * gum_cloak_has_range_containing:
+ * @address: the address to look for
+ *
+ * Determines whether a memory range containing `address` is currently cloaked.
+ *
+ * Returns: true if cloaked; false otherwise
+ */
+gboolean
+gum_cloak_has_range_containing (GumAddress address)
+{
+  gboolean is_cloaked = FALSE;
+  guint i;
+
+  gum_spinlock_acquire (&cloak_lock);
+
+  for (i = 0; i != cloaked_ranges.length; i++)
+  {
+    GumCloakedRange * cr = gum_metal_array_element_at (&cloaked_ranges, i);
+
+    if (address >= GUM_ADDRESS (cr->start) && address < GUM_ADDRESS (cr->end))
+    {
+      is_cloaked = TRUE;
+      break;
+    }
+  }
+
+  gum_spinlock_release (&cloak_lock);
+
+  return is_cloaked;
+}
+
+/**
  * gum_cloak_clip_range:
  * @range: the range to determine the visible parts of
  *
  * Determines how much of the given memory `range` is currently visible.
- * May return an empty array if the entire range is cloaked.
+ * May return an empty array if the entire range is cloaked, or NULL if it is
+ * entirely visible.
  *
- * Returns: (transfer full) (element-type Gum.MemoryRange): visible parts
+ * Returns: (transfer full) (element-type Gum.MemoryRange): NULL if all
+ * visible, or visible parts.
  */
 GArray *
 gum_cloak_clip_range (const GumMemoryRange * range)
@@ -700,4 +735,23 @@ gum_fd_compare (gconstpointer element_a,
   if (a < b)
     return -1;
   return 1;
+}
+
+void
+gum_cloak_with_lock_held (GumCloakLockedFunc func,
+                          gpointer user_data)
+{
+  gum_spinlock_acquire (&cloak_lock);
+  func (user_data);
+  gum_spinlock_release (&cloak_lock);
+}
+
+gboolean
+gum_cloak_is_locked (void)
+{
+  if (!gum_spinlock_try_acquire (&cloak_lock))
+    return TRUE;
+
+  gum_spinlock_release (&cloak_lock);
+  return FALSE;
 }

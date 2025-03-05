@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020-2021 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2020-2023 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2021 Abdelrahman Eid <hot3eed@gmail.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
@@ -877,22 +877,31 @@ _gum_quick_int_get (JSContext * ctx,
                     JSValueConst val,
                     gint * i)
 {
-  int32_t v;
-
-  if (!JS_IsNumber (val))
-    goto expected_int;
-
-  if (JS_ToInt32 (ctx, &v, val) != 0)
-    return FALSE;
-
-  *i = v;
-  return TRUE;
-
-expected_int:
+  if (JS_IsNumber (val))
   {
-    _gum_quick_throw_literal (ctx, "expected an integer");
-    return FALSE;
+    int32_t v;
+
+    if (JS_ToInt32 (ctx, &v, val) == 0)
+    {
+      *i = v;
+      return TRUE;
+    }
   }
+  else if (JS_IsBigInt (ctx, val))
+  {
+    int64_t v;
+
+    if (JS_ToInt64Ext (ctx, &v, val) == 0 &&
+        v >= G_MININT &&
+        v <= G_MAXINT)
+    {
+      *i = v;
+      return TRUE;
+    }
+  }
+
+  _gum_quick_throw_literal (ctx, "expected an integer");
+  return FALSE;
 }
 
 gboolean
@@ -900,22 +909,31 @@ _gum_quick_uint_get (JSContext * ctx,
                      JSValueConst val,
                      guint * u)
 {
-  uint32_t v;
-
-  if (!JS_IsNumber (val))
-    goto expected_uint;
-
-  if (JS_ToUint32 (ctx, &v, val) != 0)
-    return FALSE;
-
-  *u = v;
-  return TRUE;
-
-expected_uint:
+  if (JS_IsNumber (val))
   {
-    _gum_quick_throw_literal (ctx, "expected an unsigned integer");
-    return FALSE;
+    uint32_t v;
+
+    if (JS_ToUint32 (ctx, &v, val) == 0)
+    {
+      *u = v;
+      return TRUE;
+    }
   }
+  else if (JS_IsBigInt (ctx, val))
+  {
+    int64_t v;
+
+    if (JS_ToInt64Ext (ctx, &v, val) == 0 &&
+        v >= 0 &&
+        v <= G_MAXUINT)
+    {
+      *u = v;
+      return TRUE;
+    }
+  }
+
+  _gum_quick_throw_literal (ctx, "expected an unsigned integer");
+  return FALSE;
 }
 
 JSValue
@@ -960,6 +978,11 @@ _gum_quick_int64_get (JSContext * ctx,
       return FALSE;
 
     *i = v;
+  }
+  else if (JS_IsBigInt (ctx, val))
+  {
+    if (JS_ToInt64Ext (ctx, i, val) != 0)
+      return FALSE;
   }
   else
   {
@@ -1055,6 +1078,14 @@ _gum_quick_uint64_get (JSContext * ctx,
 
     *u = (guint64) v;
   }
+  else if (JS_IsBigInt (ctx, val))
+  {
+    const gchar * str = JS_ToCString (ctx, val);
+
+    *u = g_ascii_strtoull (str, NULL, 10);
+
+    JS_FreeCString (ctx, str);
+  }
   else
   {
     GumQuickUInt64 * u64;
@@ -1126,6 +1157,26 @@ _gum_quick_size_get (JSContext * ctx,
 
     *size = (gsize) v;
   }
+  else if (JS_IsBigInt (ctx, val))
+  {
+    if (sizeof (gsize) == 4)
+    {
+      int64_t v;
+
+      if (JS_ToInt64Ext (ctx, &v, val) != 0)
+        return FALSE;
+
+      *size = v;
+    }
+    else
+    {
+      const gchar * str = JS_ToCString (ctx, val);
+
+      *size = g_ascii_strtoull (str, NULL, 10);
+
+      JS_FreeCString (ctx, str);
+    }
+  }
   else if (_gum_quick_try_unwrap (val, core->uint64_class, core,
       (gpointer *) &u64))
   {
@@ -1162,11 +1213,11 @@ _gum_quick_ssize_get (JSContext * ctx,
   GumQuickInt64 * i64;
   GumQuickUInt64 * u64;
 
-  if (JS_IsNumber (val))
+  if (JS_IsNumber (val) || JS_IsBigInt (ctx, val))
   {
     int64_t v;
 
-    if (JS_ToInt64 (ctx, &v, val) != 0)
+    if (JS_ToInt64Ext (ctx, &v, val) != 0)
       goto expected_int;
 
     *size = v;
@@ -1200,15 +1251,29 @@ _gum_quick_float64_get (JSContext * ctx,
                         JSValueConst val,
                         gdouble * d)
 {
-  double v;
+  if (JS_IsNumber (val))
+  {
+    double v;
 
-  if (!JS_IsNumber (val))
+    if (JS_ToFloat64 (ctx, &v, val) != 0)
+      goto expected_number;
+
+    *d = v;
+  }
+  else if (JS_IsBigInt (ctx, val))
+  {
+    int64_t v;
+
+    if (JS_ToInt64Ext (ctx, &v, val) != 0)
+      goto expected_number;
+
+    *d = v;
+  }
+  else
+  {
     goto expected_number;
+  }
 
-  if (JS_ToFloat64 (ctx, &v, val) != 0)
-    return FALSE;
-
-  *d = v;
   return TRUE;
 
 expected_number:
@@ -1216,6 +1281,27 @@ expected_number:
     _gum_quick_throw_literal (ctx, "expected a number");
     return FALSE;
   }
+}
+
+JSValue
+_gum_quick_enum_new (JSContext * ctx,
+                     gint value,
+                     GType type)
+{
+  JSValue result;
+  GEnumClass * enum_class;
+  GEnumValue * enum_value;
+
+  enum_class = g_type_class_ref (type);
+
+  enum_value = g_enum_get_value (enum_class, value);
+  g_assert (enum_value != NULL);
+
+  result = JS_NewString (ctx, enum_value->value_nick);
+
+  g_type_class_unref (enum_class);
+
+  return result;
 }
 
 JSValue
@@ -1340,11 +1426,23 @@ _gum_quick_native_pointer_parse (JSContext * ctx,
   }
   else if (JS_IsNumber (val))
   {
+#if G_BYTE_ORDER == G_LITTLE_ENDIAN || GLIB_SIZEOF_VOID_P == 8
     union
     {
       gpointer p;
       int64_t i;
     } v;
+#else
+    union
+    {
+      struct
+      {
+        gpointer _pad;
+        gpointer p;
+      };
+      int64_t i;
+    } v;
+#endif
 
     JS_ToInt64 (ctx, &v.i, val);
 

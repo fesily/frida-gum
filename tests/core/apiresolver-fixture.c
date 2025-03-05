@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2016-2019 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2016-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -11,7 +11,7 @@
 # include "backend-darwin/gumobjcapiresolver-priv.h"
 #endif
 #ifdef HAVE_ANDROID
-# include "backend-linux/gumandroid.h"
+# include "gum/gumandroid.h"
 #endif
 
 #include <string.h>
@@ -51,6 +51,8 @@ test_api_resolver_fixture_teardown (TestApiResolverFixture * fixture,
 }
 
 static gboolean check_module_import (const GumApiDetails * details,
+    gpointer user_data);
+static gboolean check_section (const GumApiDetails * details,
     gpointer user_data);
 static gboolean match_found_cb (const GumApiDetails * details,
     gpointer user_data);

@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2008-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2008-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2020 Matt Oh <oh.jeongwook@gmail.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
@@ -7,7 +7,7 @@
 
 #include "gumsymbolutil.h"
 
-#include "gumdbghelp.h"
+#include "gum/gumdbghelp.h"
 
 #include <psapi.h>
 
@@ -17,8 +17,8 @@
 
 typedef struct _GumSymbolInfo GumSymbolInfo;
 
-#pragma pack(push)
-#pragma pack(1)
+#pragma pack (push)
+#pragma pack (1)
 
 struct _GumSymbolInfo
 {
@@ -26,7 +26,7 @@ struct _GumSymbolInfo
   gchar sym_name_buf[GUM_MAX_SYMBOL_NAME + 1];
 };
 
-#pragma pack(pop)
+#pragma pack (pop)
 
 static BOOL CALLBACK enum_functions_callback (SYMBOL_INFO * sym_info,
     gulong symbol_size, gpointer user_context);
@@ -65,15 +65,15 @@ gum_symbol_details_from_address (gpointer address,
 
     GetModuleBaseNameA (GetCurrentProcess (), mod, details->module_name,
         sizeof (details->module_name) - 1);
-    strcpy_s (details->symbol_name, sizeof (details->symbol_name),
-        si.sym_info.Name);
+    g_strlcpy (details->symbol_name, si.sym_info.Name,
+        sizeof (details->symbol_name));
   }
 
   has_file_info = dbghelp->SymGetLineFromAddr64 (GetCurrentProcess (),
       GPOINTER_TO_SIZE (address), &displacement_dw, &li);
   if (has_file_info)
   {
-    strcpy_s (details->file_name, sizeof (details->file_name), li.FileName);
+    g_strlcpy (details->file_name, li.FileName, sizeof (details->file_name));
     details->line_number = li.LineNumber;
     details->column = displacement_dw;
   }

@@ -1,10 +1,9 @@
 /*
- * Copyright (C) 2009-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2009-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2023 Håvard Sørbø <havard@hsorbo.no>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
-
-#ifndef GUM_DIET
 
 #include "gumstalker.h"
 
@@ -15,6 +14,7 @@
 #include "gummemory.h"
 #include "gummetalhash.h"
 #include "gumspinlock.h"
+#include "gumstalker-priv.h"
 #include "gumthumbreader.h"
 #include "gumthumbrelocator.h"
 #include "gumthumbwriter.h"
@@ -34,6 +34,7 @@
 #define GUM_EXEC_BLOCK_MIN_CAPACITY 1024
 
 #define GUM_INVALIDATE_TRAMPOLINE_SIZE 12
+#define GUM_EXCLUSIVE_ACCESS_MAX_DEPTH  8
 
 #define GUM_INSTRUCTION_OFFSET_NONE (-1)
 
@@ -203,6 +204,8 @@ struct _GumExecCtx
   GumMetalHashTable * mappings;
   gpointer last_arm_invalidator;
   gpointer last_thumb_invalidator;
+
+  GumExecBlock * block_list;
 };
 
 enum _GumExecCtxState
@@ -214,6 +217,8 @@ enum _GumExecCtxState
 
 struct _GumExecBlock
 {
+  GumExecBlock * next;
+
   GumExecCtx * ctx;
   GumCodeSlab * code_slab;
   GumExecBlock * storage_block;
@@ -231,8 +236,11 @@ struct _GumExecBlock
 
 enum _GumExecBlockFlags
 {
-  GUM_EXEC_BLOCK_ACTIVATION_TARGET = 1 << 0,
-  GUM_EXEC_BLOCK_THUMB             = 1 << 1,
+  GUM_EXEC_BLOCK_THUMB                 = 1 << 0,
+  GUM_EXEC_BLOCK_ACTIVATION_TARGET     = 1 << 1,
+  GUM_EXEC_BLOCK_HAS_EXCLUSIVE_LOAD    = 1 << 2,
+  GUM_EXEC_BLOCK_HAS_EXCLUSIVE_STORE   = 1 << 3,
+  GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS = 1 << 4,
 };
 
 struct _GumExecFrame
@@ -279,7 +287,6 @@ struct _GumGeneratorContext
   GumThumbWriter * thumb_writer;
 
   gpointer continuation_real_address;
-  gint exclusive_load_offset;
 };
 
 struct _GumInstruction
@@ -660,10 +667,10 @@ static void gum_exec_block_arm_close_prolog (GumExecBlock * block,
 static void gum_exec_block_thumb_close_prolog (GumExecBlock * block,
     GumGeneratorContext * gc);
 
-static gboolean gum_generator_context_is_timing_sensitive (
-    GumGeneratorContext * gc);
-static void gum_generator_context_advance_exclusive_load_offset (
-    GumGeneratorContext * gc);
+static void gum_exec_block_maybe_inherit_exclusive_access_state (
+    GumExecBlock * block, GumExecBlock * reference);
+static void gum_exec_block_propagate_exclusive_access_state (
+    GumExecBlock * block);
 
 static GumCodeSlab * gum_code_slab_new (GumExecCtx * ctx);
 static void gum_code_slab_free (GumCodeSlab * code_slab);
@@ -1025,7 +1032,8 @@ gum_stalker_follow (GumStalker * self,
     ctx.transformer = transformer;
     ctx.sink = sink;
 
-    gum_process_modify_thread (thread_id, gum_stalker_infect, &ctx);
+    gum_process_modify_thread (thread_id, gum_stalker_infect, &ctx,
+        GUM_MODIFY_THREAD_FLAGS_NONE);
   }
 }
 
@@ -1056,7 +1064,8 @@ gum_stalker_unfollow (GumStalker * self,
       dc.exec_ctx = ctx;
       dc.success = FALSE;
 
-      gum_process_modify_thread (thread_id, gum_stalker_disinfect, &dc);
+      gum_process_modify_thread (thread_id, gum_stalker_disinfect, &dc,
+          GUM_MODIFY_THREAD_FLAGS_NONE);
 
       if (dc.success)
         gum_stalker_destroy_exec_ctx (self, ctx);
@@ -1413,7 +1422,8 @@ gum_stalker_do_invalidate (GumExecCtx * ctx,
     else
     {
       gum_process_modify_thread (ctx->thread_id,
-          gum_stalker_try_invalidate_block_owned_by_thread, &ic);
+          gum_stalker_try_invalidate_block_owned_by_thread, &ic,
+          GUM_MODIFY_THREAD_FLAGS_NONE);
     }
   }
 
@@ -1575,6 +1585,64 @@ gum_call_probe_unref (GumCallProbe * probe)
   {
     gum_call_probe_finalize (probe);
   }
+}
+
+void
+_gum_stalker_modify_to_run_on_thread (GumStalker * self,
+                                      GumThreadId thread_id,
+                                      GumCpuContext * cpu_context,
+                                      GumStalkerRunOnThreadFunc func,
+                                      gpointer data)
+{
+  GumExecCtx * ctx;
+  guint32 pc;
+  GumArmWriter * cw;
+  GumAddress cpu_context_copy, infect_body;
+
+  ctx = gum_stalker_create_exec_ctx (self, thread_id, NULL, NULL);
+
+  if ((cpu_context->cpsr & GUM_PSR_T_BIT) == 0)
+    pc = cpu_context->pc;
+  else
+    pc = cpu_context->pc + 1;
+
+  gum_spinlock_acquire (&ctx->code_lock);
+
+  gum_stalker_thaw (self, ctx->thunks, self->thunks_size);
+  cw = &ctx->arm_writer;
+  gum_arm_writer_reset (cw, ctx->infect_thunk);
+
+  cpu_context_copy = GUM_ADDRESS (gum_arm_writer_cur (cw));
+  gum_arm_writer_put_bytes (cw, (guint8 *) cpu_context, sizeof (GumCpuContext));
+
+  infect_body = GUM_ADDRESS (gum_arm_writer_cur (cw));
+
+  gum_exec_ctx_write_arm_prolog (ctx, cw);
+
+  gum_arm_writer_put_call_address_with_arguments (cw,
+      GUM_ADDRESS (func), 2,
+      GUM_ARG_ADDRESS, GUM_ADDRESS (cpu_context_copy),
+      GUM_ARG_ADDRESS, GUM_ADDRESS (data));
+
+  gum_arm_writer_put_call_address_with_arguments (cw,
+      GUM_ADDRESS (gum_exec_ctx_unfollow), 2,
+      GUM_ARG_ADDRESS, GUM_ADDRESS (ctx),
+      GUM_ARG_ADDRESS, GUM_ADDRESS (pc));
+
+  gum_exec_ctx_write_arm_epilog (ctx, cw);
+
+  gum_arm_writer_put_push_regs (cw, 2, ARM_REG_R0, ARM_REG_PC);
+  gum_arm_writer_put_ldr_reg_address (cw, ARM_REG_R0, pc);
+  gum_arm_writer_put_str_reg_reg_offset (cw, ARM_REG_R0, ARM_REG_SP, 4);
+  gum_arm_writer_put_pop_regs (cw, 2, ARM_REG_R0, ARM_REG_PC);
+
+  gum_arm_writer_flush (cw);
+  gum_stalker_freeze (self, cw->base, gum_arm_writer_offset (cw));
+
+  gum_spinlock_release (&ctx->code_lock);
+
+  cpu_context->cpsr &= ~GUM_PSR_T_BIT;
+  cpu_context->pc = infect_body;
 }
 
 static GumExecCtx *
@@ -1750,9 +1818,6 @@ gum_exec_ctx_new (GumStalker * stalker,
   ctx->mappings = gum_metal_hash_table_new (NULL, NULL);
 
   gum_exec_ctx_ensure_inline_helpers_reachable (ctx);
-
-  code_slab->arm_invalidator = ctx->last_arm_invalidator;
-  code_slab->thumb_invalidator = ctx->last_thumb_invalidator;
 
   return ctx;
 }
@@ -2110,9 +2175,11 @@ gum_exec_ctx_obtain_block_for (GumExecCtx * ctx,
       aligned_address = real_address;
     }
     block->real_start = aligned_address;
+    gum_exec_block_maybe_inherit_exclusive_access_state (block, block->next);
     gum_exec_ctx_compile_block (ctx, block, aligned_address, block->code_start,
         GUM_ADDRESS (block->code_start), &block->real_size, &block->code_size);
     gum_exec_block_commit (block);
+    gum_exec_block_propagate_exclusive_access_state (block);
 
     gum_metal_hash_table_insert (ctx->mappings, real_address, block);
 
@@ -2149,6 +2216,8 @@ gum_exec_ctx_recompile_block (GumExecCtx * ctx,
   slab = block->code_slab;
   block->code_slab = ctx->scratch_slab;
   scratch_base = ctx->scratch_slab->slab.data;
+  ctx->scratch_slab->arm_invalidator = slab->arm_invalidator;
+  ctx->scratch_slab->thumb_invalidator = slab->thumb_invalidator;
 
   gum_exec_ctx_compile_block (ctx, block, block->real_start, scratch_base,
       GUM_ADDRESS (internal_code), &input_size, &output_size);
@@ -2263,7 +2332,6 @@ gum_exec_ctx_compile_arm_block (GumExecCtx * ctx,
   gc.arm_relocator = rl;
   gc.arm_writer = cw;
   gc.continuation_real_address = NULL;
-  gc.exclusive_load_offset = GUM_INSTRUCTION_OFFSET_NONE;
 
   iterator.exec_context = ctx;
   iterator.exec_block = block;
@@ -2337,7 +2405,6 @@ gum_exec_ctx_compile_thumb_block (GumExecCtx * ctx,
   gc.thumb_relocator = rl;
   gc.thumb_writer = cw;
   gc.continuation_real_address = NULL;
-  gc.exclusive_load_offset = GUM_INSTRUCTION_OFFSET_NONE;
 
   iterator.exec_context = ctx;
   iterator.exec_block = block;
@@ -2443,16 +2510,8 @@ gum_stalker_iterator_arm_next (GumStalkerIterator * self,
       return FALSE;
     }
 
-    if (gum_arm_relocator_eob (rl) &&
-        gc->exclusive_load_offset == GUM_INSTRUCTION_OFFSET_NONE)
-    {
+    if (!skip_implicitly_requested && gum_arm_relocator_eob (rl))
       return FALSE;
-    }
-
-    if (gum_is_exclusive_store_insn (instruction->ci))
-      gc->exclusive_load_offset = GUM_INSTRUCTION_OFFSET_NONE;
-
-    gum_generator_context_advance_exclusive_load_offset (gc);
   }
 
   instruction = &self->instruction;
@@ -2510,16 +2569,8 @@ gum_stalker_iterator_thumb_next (GumStalkerIterator * self,
       return FALSE;
     }
 
-    if (gum_thumb_relocator_eob (rl) &&
-        gc->exclusive_load_offset == GUM_INSTRUCTION_OFFSET_NONE)
-    {
+    if (!skip_implicitly_requested && gum_thumb_relocator_eob (rl))
       return FALSE;
-    }
-
-    if (gum_is_exclusive_store_insn (instruction->ci))
-      gc->exclusive_load_offset = GUM_INSTRUCTION_OFFSET_NONE;
-
-    gum_generator_context_advance_exclusive_load_offset (gc);
   }
 
   instruction = &self->instruction;
@@ -2574,14 +2625,25 @@ void
 gum_stalker_iterator_keep (GumStalkerIterator * self)
 {
   GumGeneratorContext * gc = self->generator_context;
+  const cs_insn * insn = gc->instruction->ci;
 
-  if (gum_is_exclusive_load_insn (gc->instruction->ci))
-    gc->exclusive_load_offset = 0;
+  if (gum_is_exclusive_load_insn (insn))
+    self->exec_block->flags |= GUM_EXEC_BLOCK_HAS_EXCLUSIVE_LOAD;
+  else if (gum_is_exclusive_store_insn (insn))
+    self->exec_block->flags |= GUM_EXEC_BLOCK_HAS_EXCLUSIVE_STORE;
 
   if (gc->is_thumb)
     gum_stalker_iterator_thumb_keep (self);
   else
     gum_stalker_iterator_arm_keep (self);
+}
+
+GumMemoryAccess
+gum_stalker_iterator_get_memory_access (GumStalkerIterator * self)
+{
+  return ((self->exec_block->flags & GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS) != 0)
+      ? GUM_MEMORY_ACCESS_EXCLUSIVE
+      : GUM_MEMORY_ACCESS_OPEN;
 }
 
 static void
@@ -2705,11 +2767,13 @@ gum_stalker_iterator_handle_thumb_branch_insn (GumStalkerIterator * self,
     case ARM_INS_MOV:
       gum_stalker_get_target_address (insn, TRUE, &target, &mask);
       gum_exec_block_virtualize_thumb_ret_insn (block, &target, FALSE, 0, gc);
+      gum_thumb_relocator_skip_one (gc->thumb_relocator);
       break;
     case ARM_INS_POP:
     case ARM_INS_LDM:
       gum_stalker_get_target_address (insn, TRUE, &target, &mask);
       gum_exec_block_virtualize_thumb_ret_insn (block, &target, TRUE, mask, gc);
+      gum_thumb_relocator_skip_one (gc->thumb_relocator);
       break;
     case ARM_INS_SMC:
     case ARM_INS_HVC:
@@ -2769,14 +2833,6 @@ gum_stalker_iterator_handle_thumb_it_insn (GumStalkerIterator * self)
        */
       insn->detail->arm.cc = ARM_CC_AL;
       gum_stalker_iterator_handle_thumb_branch_insn (self, insn);
-
-      /*
-       * Put a breakpoint to trap and detect any errant continued execution (the
-       * branch should handle any possible continuation). Skip the original
-       * branch instruction.
-       */
-      gum_thumb_writer_put_breakpoint (gc->thumb_writer);
-      gum_thumb_relocator_skip_one (gc->thumb_relocator);
     }
     else
     {
@@ -3355,6 +3411,41 @@ gum_stalker_invoke_callout (GumCalloutEntry * entry,
   ec->pending_calls--;
 }
 
+void
+gum_stalker_iterator_put_chaining_return (GumStalkerIterator * self)
+{
+   GumExecBlock * block = self->exec_block;
+   GumGeneratorContext * gc = self->generator_context;
+   GumBranchTarget target;
+   GumBranchDirectRegOffset * value;
+
+   target.type = GUM_TARGET_DIRECT_REG_OFFSET;
+   value = &target.value.direct_reg_offset;
+   value->reg = ARM_REG_LR;
+   value->offset = 0;
+   value->mode = GUM_ARM_MODE_CURRENT;
+
+  if (gc->is_thumb)
+  {
+    gum_exec_block_virtualize_thumb_ret_insn (block, &target, FALSE, 0, gc);
+  }
+  else
+  {
+    gum_exec_block_virtualize_arm_ret_insn (block, &target, ARM_CC_AL, FALSE, 0,
+        gc);
+  }
+}
+
+csh
+gum_stalker_iterator_get_capstone (GumStalkerIterator * self)
+{
+  const GumGeneratorContext * gc = self->generator_context;
+
+  return gc->is_thumb
+      ? gc->thumb_relocator->capstone
+      : gc->arm_relocator->capstone;
+}
+
 static void
 gum_exec_ctx_write_arm_prolog (GumExecCtx * ctx,
                                GumArmWriter * cw)
@@ -3625,6 +3716,8 @@ gum_exec_ctx_ensure_inline_helpers_reachable (GumExecCtx * ctx)
       gum_exec_ctx_write_arm_invalidator);
   gum_exec_ctx_ensure_thumb_helper_reachable (ctx, &ctx->last_thumb_invalidator,
       gum_exec_ctx_write_thumb_invalidator);
+  ctx->code_slab->arm_invalidator = ctx->last_arm_invalidator;
+  ctx->code_slab->thumb_invalidator = ctx->last_thumb_invalidator;
 }
 
 static void
@@ -4128,6 +4221,9 @@ gum_exec_block_new (GumExecCtx * ctx)
    */
   gum_slab_align_cursor (&code_slab->slab, 4);
 
+  block->next = ctx->block_list;
+  ctx->block_list = block;
+
   block->ctx = ctx;
   block->code_slab = code_slab;
 
@@ -4386,7 +4482,7 @@ gum_exec_block_virtualize_arm_branch_insn (GumExecBlock * block,
   gum_exec_block_write_arm_handle_not_taken (block, target, cc, gc);
 
   if ((ec->sink_mask & GUM_EXEC) != 0 &&
-      !gum_generator_context_is_timing_sensitive (gc))
+      (block->flags & GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS) == 0)
   {
     gum_exec_block_arm_open_prolog (block, gc);
     backpatch_prolog_state = GUM_PROLOG_OPEN;
@@ -4448,7 +4544,7 @@ gum_exec_block_virtualize_thumb_branch_insn (GumExecBlock * block,
   gum_exec_block_write_thumb_handle_not_taken (block, target, cc, cc_reg, gc);
 
   if ((ec->sink_mask & GUM_EXEC) != 0 &&
-      !gum_generator_context_is_timing_sensitive (gc))
+      (block->flags & GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS) == 0)
   {
     gum_exec_block_thumb_open_prolog (block, gc);
     backpatch_prolog_state = GUM_PROLOG_OPEN;
@@ -4493,6 +4589,14 @@ gum_exec_block_virtualize_thumb_branch_insn (GumExecBlock * block,
 
   gum_exec_block_write_thumb_handle_writeback (block, writeback, gc);
   gum_exec_block_write_thumb_exec_generated_code (cw, block->ctx);
+
+  /*
+   * We MUST do this last to account for IT blocks.
+   * gum_thumb_relocator_skip_one() will complete the IT branch, so if we do
+   * this early (like on ARM), then the end branch will be relocated into the
+   * middle of the relocated branch.
+   */
+  gum_thumb_relocator_skip_one (gc->thumb_relocator);
 }
 
 static void
@@ -4550,6 +4654,14 @@ gum_exec_block_virtualize_thumb_call_insn (GumExecBlock * block,
   gum_thumb_writer_put_ldr_reg_address (gc->thumb_writer, ARM_REG_LR,
       GUM_ADDRESS (ret_real_address));
   gum_exec_block_write_thumb_exec_generated_code (gc->thumb_writer, block->ctx);
+
+  /*
+   * We MUST do this last to account for IT blocks.
+   * gum_thumb_relocator_skip_one() will complete the IT branch, so if we do
+   * this early (like on ARM), then the end branch will be relocated into the
+   * middle of the relocated branch.
+   */
+  gum_thumb_relocator_skip_one (gc->thumb_relocator);
 }
 
 static void
@@ -4609,6 +4721,8 @@ gum_exec_block_virtualize_arm_ret_insn (GumExecBlock * block,
   }
 
   gum_exec_block_write_arm_exec_generated_code (gc->arm_writer, block->ctx);
+
+  gum_arm_relocator_skip_one (gc->arm_relocator);
 }
 
 static void
@@ -5045,7 +5159,10 @@ gum_exec_block_write_arm_handle_excluded (GumExecBlock * block,
   if (target->type == GUM_TARGET_DIRECT_ADDRESS)
   {
     if (!check (block->ctx, target->value.direct_address.address))
+    {
+      gum_arm_relocator_skip_one (gc->arm_relocator);
       return;
+    }
   }
 
   if (target->type != GUM_TARGET_DIRECT_ADDRESS)
@@ -5183,7 +5300,7 @@ gum_exec_block_write_arm_handle_not_taken (GumExecBlock * block,
    */
 
   if ((ec->sink_mask & GUM_EXEC) != 0 &&
-      !gum_generator_context_is_timing_sensitive (gc))
+      (block->flags & GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS) == 0)
   {
     gum_exec_block_arm_open_prolog (block, gc);
     backpatch_prolog_state = GUM_PROLOG_OPEN;
@@ -5274,7 +5391,7 @@ gum_exec_block_write_thumb_handle_not_taken (GumExecBlock * block,
     GumAddress backpatch_code_start;
 
     if ((ec->sink_mask & GUM_EXEC) != 0 &&
-        !gum_generator_context_is_timing_sensitive (gc))
+        (block->flags & GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS) == 0)
     {
       gum_exec_block_thumb_open_prolog (block, gc);
       backpatch_prolog_state = GUM_PROLOG_OPEN;
@@ -5519,7 +5636,7 @@ static void
 gum_exec_block_write_arm_exec_event_code (GumExecBlock * block,
                                           GumGeneratorContext * gc)
 {
-  if (gum_generator_context_is_timing_sensitive (gc))
+  if ((block->flags & GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS) != 0)
     return;
 
   gum_arm_writer_put_call_address_with_arguments (gc->arm_writer,
@@ -5533,7 +5650,7 @@ static void
 gum_exec_block_write_thumb_exec_event_code (GumExecBlock * block,
                                             GumGeneratorContext * gc)
 {
-  if (gum_generator_context_is_timing_sensitive (gc))
+  if ((block->flags & GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS) != 0)
     return;
 
   gum_thumb_writer_put_call_address_with_arguments (gc->thumb_writer,
@@ -5831,22 +5948,61 @@ gum_exec_block_thumb_close_prolog (GumExecBlock * block,
   gum_exec_ctx_write_thumb_epilog (block->ctx, gc->thumb_writer);
 }
 
-static gboolean
-gum_generator_context_is_timing_sensitive (GumGeneratorContext * gc)
+static void
+gum_exec_block_maybe_inherit_exclusive_access_state (GumExecBlock * block,
+                                                     GumExecBlock * reference)
 {
-  return gc->exclusive_load_offset != GUM_INSTRUCTION_OFFSET_NONE;
+  const guint8 * real_address = block->real_start;
+  GumExecBlock * cur;
+
+  for (cur = reference; cur != NULL; cur = cur->next)
+  {
+    if ((cur->flags & GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS) == 0)
+      return;
+
+    if (real_address >= cur->real_start &&
+        real_address < cur->real_start + cur->real_size)
+    {
+      block->flags |= GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS;
+      return;
+    }
+  }
 }
 
 static void
-gum_generator_context_advance_exclusive_load_offset (GumGeneratorContext * gc)
+gum_exec_block_propagate_exclusive_access_state (GumExecBlock * block)
 {
-  if (gc->exclusive_load_offset == GUM_INSTRUCTION_OFFSET_NONE)
+  GumExecBlock * block_containing_load, * cur;
+  guint i;
+
+  if ((block->flags & GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS) != 0)
     return;
 
-  gc->exclusive_load_offset++;
+  if ((block->flags & GUM_EXEC_BLOCK_HAS_EXCLUSIVE_STORE) == 0)
+    return;
 
-  if (gc->exclusive_load_offset == 4)
-    gc->exclusive_load_offset = GUM_INSTRUCTION_OFFSET_NONE;
+  block_containing_load = NULL;
+  for (cur = block, i = 0;
+      cur != NULL && i != GUM_EXCLUSIVE_ACCESS_MAX_DEPTH;
+      cur = cur->next, i++)
+  {
+    if ((cur->flags & GUM_EXEC_BLOCK_HAS_EXCLUSIVE_LOAD) != 0)
+    {
+      block_containing_load = cur;
+      break;
+    }
+  }
+  if (block_containing_load == NULL)
+    return;
+
+  for (cur = block; TRUE; cur = cur->next)
+  {
+    cur->flags |= GUM_EXEC_BLOCK_USES_EXCLUSIVE_ACCESS;
+    gum_exec_block_invalidate (cur);
+
+    if (cur == block_containing_load)
+      break;
+  }
 }
 
 static GumCodeSlab *
@@ -6020,11 +6176,11 @@ gum_find_thread_exit_implementation (void)
 {
 #if defined (HAVE_GLIBC)
   return GSIZE_TO_POINTER (gum_module_find_export_by_name (
-        gum_process_query_libc_name (),
+        gum_process_get_libc_module (),
         "__call_tls_dtors"));
 #elif defined (HAVE_ANDROID)
   return GSIZE_TO_POINTER (gum_module_find_export_by_name (
-        gum_process_query_libc_name (),
+        gum_process_get_libc_module (),
         "pthread_exit"));
 #else
   return NULL;
@@ -6139,5 +6295,3 @@ gum_count_trailing_zeros (guint16 value)
   return num_zeros;
 #endif
 }
-
-#endif

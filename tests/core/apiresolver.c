@@ -1,5 +1,6 @@
 /*
- * Copyright (C) 2016-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2016-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2023 Håvard Sørbø <havard@hsorbo.no>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -10,11 +11,13 @@ TESTLIST_BEGIN (api_resolver)
   TESTENTRY (module_exports_can_be_resolved_case_sensitively)
   TESTENTRY (module_exports_can_be_resolved_case_insensitively)
   TESTENTRY (module_imports_can_be_resolved)
+  TESTENTRY (module_sections_can_be_resolved)
   TESTENTRY (objc_methods_can_be_resolved_case_sensitively)
   TESTENTRY (objc_methods_can_be_resolved_case_insensitively)
 #ifdef HAVE_DARWIN
   TESTENTRY (objc_method_can_be_resolved_from_class_method_address)
   TESTENTRY (objc_method_can_be_resolved_from_instance_method_address)
+  TESTENTRY (swift_method_can_be_resolved)
 #endif
 #ifdef HAVE_ANDROID
   TESTENTRY (linker_exports_can_be_resolved_on_android)
@@ -101,6 +104,38 @@ check_module_import (const GumApiDetails * details,
   return TRUE;
 }
 
+TESTCASE (module_sections_can_be_resolved)
+{
+#if defined (HAVE_DARWIN) || defined (HAVE_ELF)
+  GError * error = NULL;
+  const gchar * query = "sections:gum-tests!*data*";
+  guint number_of_sections_seen = 0;
+
+  fixture->resolver = gum_api_resolver_make ("module");
+  g_assert_nonnull (fixture->resolver);
+
+  gum_api_resolver_enumerate_matches (fixture->resolver, query, check_section,
+      &number_of_sections_seen, &error);
+  g_assert_no_error (error);
+  g_assert_cmpuint (number_of_sections_seen, >, 1);
+#else
+  (void) check_section;
+#endif
+}
+
+static gboolean
+check_section (const GumApiDetails * details,
+               gpointer user_data)
+{
+  guint * number_of_sections_seen = user_data;
+
+  g_assert_nonnull (strstr (details->name, "data"));
+
+  (*number_of_sections_seen)++;
+
+  return TRUE;
+}
+
 TESTCASE (objc_methods_can_be_resolved_case_sensitively)
 {
   TestForEachContext ctx;
@@ -163,6 +198,8 @@ match_found_cb (const GumApiDetails * details,
 
 static gboolean resolve_method_impl (const GumApiDetails * details,
     gpointer user_data);
+static gboolean accumulate_matches (const GumApiDetails * details,
+    gpointer user_data);
 
 TESTCASE (objc_method_can_be_resolved_from_class_method_address)
 {
@@ -210,6 +247,30 @@ TESTCASE (objc_method_can_be_resolved_from_instance_method_address)
   g_free (method);
 }
 
+TESTCASE (swift_method_can_be_resolved)
+{
+  guint num_matches;
+  GError * error = NULL;
+
+  fixture->resolver = gum_api_resolver_make ("swift");
+
+  num_matches = 0;
+  gum_api_resolver_enumerate_matches (fixture->resolver,
+      "functions:*!*", accumulate_matches, &num_matches, &error);
+  if (g_error_matches (error, GUM_ERROR, GUM_ERROR_NOT_SUPPORTED))
+    goto not_supported;
+  g_assert_no_error (error);
+
+  return;
+
+not_supported:
+  {
+    g_print ("<skipping, not available> ");
+
+    g_error_free (error);
+  }
+}
+
 static gboolean
 resolve_method_impl (const GumApiDetails * details,
                      gpointer user_data)
@@ -219,6 +280,17 @@ resolve_method_impl (const GumApiDetails * details,
   *address = details->address;
 
   return FALSE;
+}
+
+static gboolean
+accumulate_matches (const GumApiDetails * details,
+                    gpointer user_data)
+{
+  guint * total = user_data;
+
+  (*total)++;
+
+  return TRUE;
 }
 
 #endif
@@ -248,7 +320,7 @@ TESTCASE (linker_exports_can_be_resolved_on_android)
     "dlclose",
     "dlerror",
   };
-  const gchar * correct_module_name, * incorrect_module_name;
+  GumModule * correct_module, * incorrect_module;
   guint i;
 
   if (gum_android_get_api_level () >= 29)
@@ -272,13 +344,13 @@ TESTCASE (linker_exports_can_be_resolved_on_android)
 
   if (gum_android_get_api_level () >= 26)
   {
-    correct_module_name = libdl_name;
-    incorrect_module_name = linker_name;
+    correct_module = gum_process_find_module_by_name (libdl_name);
+    incorrect_module = gum_process_find_module_by_name (linker_name);
   }
   else
   {
-    correct_module_name = linker_name;
-    incorrect_module_name = libdl_name;
+    correct_module = gum_process_find_module_by_name (linker_name);
+    incorrect_module = gum_process_find_module_by_name (libdl_name);
   }
 
   fixture->resolver = gum_api_resolver_make ("module");
@@ -294,13 +366,14 @@ TESTCASE (linker_exports_can_be_resolved_on_android)
     query = g_strconcat ("exports:*!", func_name, NULL);
 
     g_assert_true (
-        gum_module_find_export_by_name (incorrect_module_name, func_name) == 0);
+        gum_module_find_export_by_name (incorrect_module, func_name) == 0);
 
     ctx.number_of_calls = 0;
-    ctx.expected_name =
-        g_strdup_printf ("%s!%s", correct_module_name, func_name);
+    ctx.expected_name = g_strdup_printf ("%s!%s",
+        gum_module_get_name (correct_module),
+        func_name);
     ctx.expected_address =
-        gum_module_find_export_by_name (correct_module_name, func_name);
+        gum_module_find_export_by_name (correct_module, func_name);
     g_assert_cmpuint (ctx.expected_address, !=, 0);
 
     gum_api_resolver_enumerate_matches (fixture->resolver, query,
@@ -312,6 +385,9 @@ TESTCASE (linker_exports_can_be_resolved_on_android)
 
     g_free (query);
   }
+
+  g_object_unref (incorrect_module);
+  g_object_unref (correct_module);
 }
 
 static gboolean

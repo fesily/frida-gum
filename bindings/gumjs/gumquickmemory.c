@@ -1,6 +1,8 @@
 /*
- * Copyright (C) 2020 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2020-2025 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  * Copyright (C) 2021 Abdelrahman Eid <hot3eed@gmail.com>
+ * Copyright (C) 2023 Håvard Sørbø <havard@hsorbo.no>
+ * Copyright (C) 2025 Kenjiro Ichise <ichise@doranekosystems.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -77,6 +79,7 @@ struct _GumMemoryScanSyncContext
 GUMJS_DECLARE_FUNCTION (gumjs_memory_alloc)
 GUMJS_DECLARE_FUNCTION (gumjs_memory_copy)
 GUMJS_DECLARE_FUNCTION (gumjs_memory_protect)
+GUMJS_DECLARE_FUNCTION (gumjs_memory_query_protection)
 GUMJS_DECLARE_FUNCTION (gumjs_memory_patch_code)
 static void gum_memory_patch_context_apply (gpointer mem,
     GumMemoryPatchContext * self);
@@ -86,6 +89,8 @@ static JSValue gum_quick_memory_read (JSContext * ctx, GumMemoryValueType type,
     GumQuickArgs * args, GumQuickCore * core);
 static JSValue gum_quick_memory_write (JSContext * ctx, GumMemoryValueType type,
     GumQuickArgs * args, GumQuickCore * core);
+GUMJS_DECLARE_FUNCTION (gum_quick_memory_read_volatile)
+GUMJS_DECLARE_FUNCTION (gum_quick_memory_write_volatile)
 
 static void gum_quick_memory_on_access (GumMemoryAccessMonitor * monitor,
     const GumMemoryAccessDetails * details, GumQuickMemory * self);
@@ -154,6 +159,7 @@ GUMJS_DECLARE_FUNCTION (gumjs_memory_access_monitor_disable)
 static void gum_quick_memory_clear_monitor (GumQuickMemory * self,
     JSContext * ctx);
 
+GUMJS_DECLARE_GETTER (gumjs_memory_access_details_get_thread_id)
 GUMJS_DECLARE_GETTER (gumjs_memory_access_details_get_operation)
 GUMJS_DECLARE_GETTER (gumjs_memory_access_details_get_from)
 GUMJS_DECLARE_GETTER (gumjs_memory_access_details_get_address)
@@ -167,6 +173,7 @@ static const JSCFunctionListEntry gumjs_memory_entries[] =
   JS_CFUNC_DEF ("_alloc", 0, gumjs_memory_alloc),
   JS_CFUNC_DEF ("copy", 0, gumjs_memory_copy),
   JS_CFUNC_DEF ("protect", 0, gumjs_memory_protect),
+  JS_CFUNC_DEF ("queryProtection", 0, gumjs_memory_query_protection),
   JS_CFUNC_DEF ("_patchCode", 0, gumjs_memory_patch_code),
   JS_CFUNC_DEF ("_checkCodePointer", 0, gumjs_memory_check_code_pointer),
 
@@ -192,6 +199,8 @@ static const JSCFunctionListEntry gumjs_memory_entries[] =
   GUMJS_EXPORT_MEMORY_READ_WRITE ("Utf8String", UTF8_STRING),
   GUMJS_EXPORT_MEMORY_READ_WRITE ("Utf16String", UTF16_STRING),
   GUMJS_EXPORT_MEMORY_READ_WRITE ("AnsiString", ANSI_STRING),
+  JS_CFUNC_DEF ("readVolatile", 0, gum_quick_memory_read_volatile),
+  JS_CFUNC_DEF ("writeVolatile", 0, gum_quick_memory_write_volatile),
 
   JS_CFUNC_DEF ("allocAnsiString", 0, gumjs_memory_alloc_ansi_string),
   JS_CFUNC_DEF ("allocUtf8String", 0, gumjs_memory_alloc_utf8_string),
@@ -214,6 +223,7 @@ static const JSClassDef gumjs_memory_access_details_def =
 
 static const JSCFunctionListEntry gumjs_memory_access_details_entries[] =
 {
+  JS_CGETSET_DEF ("threadId", gumjs_memory_access_details_get_thread_id, NULL),
   JS_CGETSET_DEF ("operation", gumjs_memory_access_details_get_operation, NULL),
   JS_CGETSET_DEF ("from", gumjs_memory_access_details_get_from, NULL),
   JS_CGETSET_DEF ("address", gumjs_memory_access_details_get_address, NULL),
@@ -371,6 +381,26 @@ GUMJS_DEFINE_FUNCTION (gumjs_memory_protect)
     success = TRUE;
 
   return JS_NewBool (ctx, success);
+}
+
+GUMJS_DEFINE_FUNCTION (gumjs_memory_query_protection)
+{
+  gpointer address;
+  GumPageProtection prot;
+
+  if (!_gum_quick_args_parse (args, "p", &address))
+    goto propagate_exception;
+
+  if (!gum_memory_query_protection (address, &prot))
+    goto query_failed;
+
+  return _gum_quick_page_protection_new (ctx, prot);
+
+query_failed:
+  _gum_quick_throw_literal (ctx, "failed to query address");
+
+propagate_exception:
+  return JS_EXCEPTION;
 }
 
 GUMJS_DEFINE_FUNCTION (gumjs_memory_patch_code)
@@ -834,6 +864,61 @@ gum_quick_memory_write (JSContext * ctx,
   return result;
 }
 
+GUMJS_DEFINE_FUNCTION (gum_quick_memory_read_volatile)
+{
+  gpointer address;
+  gsize length;
+  gsize n_bytes_read;
+  guint8 * data;
+
+  if (!_gum_quick_args_parse (args, "pz", &address, &length))
+    return JS_EXCEPTION;
+
+  data = gum_memory_read (address, length, &n_bytes_read);
+  if (data == NULL)
+    return _gum_quick_throw_literal (ctx, "memory read failed");
+
+  return JS_NewArrayBuffer (ctx, data, n_bytes_read,
+      _gum_quick_array_buffer_free, data, FALSE);
+}
+
+GUMJS_DEFINE_FUNCTION (gum_quick_memory_write_volatile)
+{
+  JSValue result;
+  gpointer address;
+  GBytes * bytes = NULL;
+  gconstpointer data;
+  gsize size;
+
+  if (!_gum_quick_args_parse (args, "pB", &address, &bytes))
+    goto propagate_exception;
+
+  data = g_bytes_get_data (bytes, &size);
+
+  if (!gum_memory_write (address, data, size))
+    goto write_failed;
+
+  result = JS_UNDEFINED;
+  goto beach;
+
+write_failed:
+  {
+    _gum_quick_throw_literal (ctx, "memory write failed");
+    goto propagate_exception;
+  }
+propagate_exception:
+  {
+    result = JS_EXCEPTION;
+    goto beach;
+  }
+beach:
+  {
+    g_bytes_unref (bytes);
+
+    return result;
+  }
+}
+
 #ifdef HAVE_WINDOWS
 
 static gchar *
@@ -1123,7 +1208,7 @@ GUMJS_DEFINE_FUNCTION (gumjs_memory_access_monitor_enable)
   GumQuickMemory * self;
   GArray * ranges;
   JSValue on_access;
-  GError *error;
+  GError * error;
 
   self = gumjs_get_parent_module (core);
 
@@ -1188,13 +1273,21 @@ gum_quick_memory_on_access (GumMemoryAccessMonitor * monitor,
   JSContext * ctx = core->ctx;
   GumQuickScope scope;
   JSValue d;
+  GumQuickCpuContext * cpu_context;
 
   _gum_quick_scope_enter (&scope, core);
 
   d = JS_NewObjectClass (ctx, self->memory_access_details_class);
   JS_SetOpaque (d, (void *) details);
 
+  JS_DefinePropertyValue (ctx, d, GUM_QUICK_CORE_ATOM (core, context),
+      _gum_quick_cpu_context_new (ctx, details->context,
+          GUM_CPU_CONTEXT_READWRITE, core, &cpu_context),
+      JS_PROP_C_W_E);
+
   _gum_quick_scope_call_void (&scope, self->on_access, JS_UNDEFINED, 1, &d);
+
+  _gum_quick_cpu_context_make_read_only (cpu_context);
 
   JS_SetOpaque (d, NULL);
   JS_FreeValue (ctx, d);
@@ -1223,6 +1316,16 @@ gum_quick_memory_access_details_get (JSContext * ctx,
 
   *details = d;
   return TRUE;
+}
+
+GUMJS_DEFINE_GETTER (gumjs_memory_access_details_get_thread_id)
+{
+  const GumMemoryAccessDetails * details;
+
+  if (!gum_quick_memory_access_details_get (ctx, this_val, core, &details))
+    return JS_EXCEPTION;
+
+  return JS_NewInt64 (ctx, details->thread_id);
 }
 
 GUMJS_DEFINE_GETTER (gumjs_memory_access_details_get_operation)

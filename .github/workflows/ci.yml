@@ -9,253 +9,216 @@ on:
       - main
 
 env:
-  PYTHON_VERSION: 3.11
-  MESON_VERSION: 0.64.0
+  GUM_OPTIONS: '--enable-gumpp --enable-gumjs --with-devkits=gum,gumjs --enable-tests'
 
 jobs:
   gir:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
       - name: Check out repo
-        uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/checkout@v4
         with:
-          python-version: '${{ env.PYTHON_VERSION }}'
+          submodules: recursive
       - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install \
-            gobject-introspection \
-            libdwarf-dev \
-            libelf-dev \
-            libgirepository1.0-dev \
-            libglib2.0-dev \
-            libjson-glib-dev \
-            libsoup-3.0-dev \
-            libsqlite3-dev \
-            libunwind-dev \
-            ninja-build
-          pip install meson==${{ env.MESON_VERSION }}
+              gobject-introspection \
+              libgirepository1.0-dev \
+              libglib2.0-dev \
+              libjson-glib-dev \
+              libsoup-3.0-dev \
+              libsqlite3-dev \
+              libunwind-dev \
+              ninja-build
       - name: Build
         run: |
-          meson setup \
-            -Doptimization=s \
-            -Dgumpp=enabled \
-            -Dgumjs=enabled \
-            build
-          meson compile -C build
+          ./configure \
+              --enable-shared \
+              --without-prebuilds=toolchain,sdk \
+              --disable-tests \
+              -- \
+              --force-fallback-for=libdwarf
+          make
+      - name: Upload GObject introspection data
+        uses: actions/upload-artifact@v4
+        with:
+          name: gum-gir
+          path: |
+            build/gum/Gum-1.0.gir
+            build/gum/Gum-1.0.typelib
 
-  windows:
-    runs-on: windows-latest
+  native:
     strategy:
       matrix:
-        arch: [amd64_x86, amd64]
+        include:
+          - { id: windows-x86_64, runner: '"windows-latest"'                    }
+          - { id: windows-x86,    runner: '"windows-latest"'                    }
+          - { id: macos-x86_64,   runner: '"macos-13"'                          }
+          - { id: macos-arm64,    runner: '"macos-latest"'                      }
+          - { id: linux-x86_64,   runner: '"ubuntu-latest"'                     }
+          - { id: linux-x86,      runner: '"ubuntu-latest"'                     }
+          - { id: freebsd-arm64,  runner: '["self-hosted", "freebsd", "arm64"]' }
       fail-fast: false
+    runs-on: ${{ fromJSON(matrix.runner) }}
     steps:
       - name: Check out repo
-        uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/checkout@v4
         with:
-          python-version: '${{ env.PYTHON_VERSION }}'
-      - name: Install dependencies
-        run: pip install meson==${{ env.MESON_VERSION }} ninja
-      - name: Environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: ${{ matrix.arch }}
-      - name: Build
-        run: |
-          meson setup `
-            --default-library static `
-            -Doptimization=s `
-            -Dgumpp=enabled `
-            -Dgumjs=enabled `
-            --force-fallback-for=zlib `
-            build
-          meson compile -C build
-      - name: Test
-        run: |
-          Copy-Item build\bindings\gumpp\frida-gumpp-1.0.dll -Destination build\tests\
-          .\build\tests\gum-tests.exe
-
-  macos-x86_64:
-    runs-on: macos-latest
-    steps:
-      - name: Check out repo
-        uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '${{ env.PYTHON_VERSION }}'
-      - name: Install dependencies
-        run: pip install meson==${{ env.MESON_VERSION }} ninja
-      - name: Build
-        run: |
-          meson setup \
-            --default-library static \
-            -Doptimization=s \
-            -Dgumpp=enabled \
-            -Dgumjs=enabled \
-            --force-fallback-for=glib \
-            build
-          meson compile -C build
-      - name: Test
-        run: ./build/tests/gum-tests
-
-  linux-x86:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repo
-        uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '${{ env.PYTHON_VERSION }}'
-      - name: Install dependencies
+          submodules: recursive
+      - name: Install gcc-multilib
+        if: matrix.id == 'linux-x86'
         run: |
           sudo apt-get update
-          sudo apt-get install gcc-multilib lib32stdc++-9-dev
-          pip install meson==${{ env.MESON_VERSION }}
-          .github/env/bootstrap.sh linux-x86_64 linux-x86
+          sudo apt-get install gcc-multilib lib32stdc++-13-dev
       - name: Build
+        if: ${{ startsWith(matrix.id, 'windows-') }}
         run: |
-          export PATH="/tmp/toolchain/bin:$PATH"
-          meson setup \
-            --native-file /tmp/native.txt \
-            --cross-file /tmp/cross.txt \
-            --default-library static \
-            --force-fallback-for=glib \
-            -Doptimization=s \
-            -Dwerror=true \
-            -Dgumpp=enabled \
-            -Dgumjs=enabled \
-            build
-          meson compile -C build
-      - name: Test
-        run: ./build/tests/gum-tests
-
-  linux-x86_64:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repo
-        uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
+          .\configure ${{ env.GUM_OPTIONS }}
+          .\make
+      - name: Build
+        if: ${{ !startsWith(matrix.id, 'windows-') && matrix.id != 'linux-x86' }}
+        run: |
+          ./configure ${{ env.GUM_OPTIONS }}
+          make
+      - name: Build
+        if: matrix.id == 'linux-x86'
+        run: |
+          CC="gcc -m32" CXX="g++ -m32" STRIP="strip" \
+              ./configure --build=linux-x86 --host=linux-x86 ${{ env.GUM_OPTIONS }}
+          make
+      - name: Upload Gum devkit
+        if: ${{ !startsWith(matrix.id, 'linux-') }}
+        uses: actions/upload-artifact@v4
         with:
-          python-version: '${{ env.PYTHON_VERSION }}'
-      - name: Install dependencies
-        run: pip install meson==${{ env.MESON_VERSION }} ninja
-      - name: Build
-        run: |
-          meson setup \
-            --default-library static \
-            --force-fallback-for=glib \
-            -Doptimization=s \
-            -Dgumpp=enabled \
-            -Dgumjs=enabled \
-            build
-          meson compile -C build
+          name: gum-devkit-${{ matrix.id }}
+          path: build/gum/devkit/
+      - name: Upload GumJS devkit
+        if: ${{ !startsWith(matrix.id, 'linux-') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gumjs-devkit-${{ matrix.id }}
+          path: build/bindings/gumjs/devkit/
       - name: Test
-        run: ./build/tests/gum-tests
+        run: make test
 
-  linux-mips:
-    runs-on: ubuntu-18.04
+  cross:
     strategy:
       matrix:
-        arch:
-          - id: mips
-            pkg: g++-mips-linux-gnu
-          - id: mipsel
-            pkg: g++-mipsel-linux-gnu
-          - id: mips64
-            pkg: g++-mips64-linux-gnuabi64
-          - id: mips64el
-            pkg: g++-mips64el-linux-gnuabi64
+        include:
+          - { id: windows-x86_64-mingw, opts: '--host=x86_64-w64-mingw32 --without-prebuilds=sdk:host', pkg: g++-mingw-w64-x86-64        }
+          - { id: windows-x86-mingw,    opts: '--host=i686-w64-mingw32 --without-prebuilds=sdk:host',   pkg: g++-mingw-w64-i686          }
+          - { id: linux-mips,           opts: '--host=mips-linux-gnu',                                  pkg: g++-mips-linux-gnu          }
+          - { id: linux-mipsel,         opts: '--host=mipsel-linux-gnu',                                pkg: g++-mipsel-linux-gnu        }
+          - { id: linux-mips64,         opts: '--host=mips64-linux-gnuabi64',                           pkg: g++-mips64-linux-gnuabi64   }
+          - { id: linux-mips64el,       opts: '--host=mips64el-linux-gnuabi64',                         pkg: g++-mips64el-linux-gnuabi64 }
+      fail-fast: false
+    runs-on: ubuntu-latest
     steps:
       - name: Check out repo
-        uses: actions/checkout@v3
-      - name: Install Python
-        uses: actions/setup-python@v3
+        uses: actions/checkout@v4
         with:
-          python-version: '${{ env.PYTHON_VERSION }}'
-      - name: Install dependencies
+          submodules: recursive
+      - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install ${{ matrix.arch.pkg }}
-          pip install meson==${{ env.MESON_VERSION }}
-          .github/env/bootstrap.sh linux-x86_64 linux-${{ matrix.arch.id }}
+          sudo apt-get install ${{ matrix.pkg }}
       - name: Build
         run: |
-          export PATH="/tmp/toolchain/bin:$PATH"
-          meson setup \
-            --native-file /tmp/native.txt \
-            --cross-file /tmp/cross.txt \
-            --default-library static \
-            -Doptimization=s \
-            -Dwerror=true \
-            -Dgumpp=enabled \
-            -Dgumjs=enabled \
-            -Dtests=enabled \
-            build
-          meson compile -C build
+          ./configure ${{ matrix.opts }} ${{ env.GUM_OPTIONS }}
+          make
+      - name: Upload Gum devkit
+        if: ${{ !startsWith(matrix.id, 'linux-') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gum-devkit-${{ matrix.id }}
+          path: build/gum/devkit/
+      - name: Upload GumJS devkit
+        if: ${{ !startsWith(matrix.id, 'linux-') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gumjs-devkit-${{ matrix.id }}
+          path: build/bindings/gumjs/devkit/
 
-  freebsd-arm64:
-    runs-on: [self-hosted, freebsd, arm64]
-    steps:
-      - name: Checkout monorepo
-        uses: actions/checkout@v3
-      - name: Install dependencies
-        run: pip install meson==${{ env.MESON_VERSION }}
-      - name: Build
-        run: |
-          meson setup \
-            --default-library static \
-            -Doptimization=s \
-            -Dgumpp=enabled \
-            -Dgumjs=enabled \
-            -Db_lundef=false \
-            build
-          meson compile -C build
-      - name: Test
-        run: ./build/tests/gum-tests
-
-  ios-arm64:
-    runs-on: macos-latest
+  manylinux:
+    strategy:
+      matrix:
+        arch: [x86, x86_64, x86_64-musl, armhf, arm64, arm64-musl, mips, mipsel, mips64, mips64el]
+      fail-fast: false
+    runs-on: ubuntu-latest
+    container: ghcr.io/frida/x-tools-linux-${{ matrix.arch }}:latest
     steps:
       - name: Check out repo
-        uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/checkout@v4
         with:
-          python-version: '${{ env.PYTHON_VERSION }}'
-      - name: Install dependencies
-        run: |
-          pip install meson==${{ env.MESON_VERSION }}
-          .github/env/bootstrap.sh macos-x86_64 ios-arm64
+          submodules: recursive
       - name: Build
         run: |
-          export PATH="/tmp/toolchain/bin:$PATH"
-          meson setup \
-            --native-file /tmp/native.txt \
-            --cross-file /tmp/cross.txt \
-            --default-library static \
-            -Doptimization=s \
-            -Dwerror=true \
-            -Dgumpp=enabled \
-            -Dgumjs=enabled \
-            -Dtests=enabled \
-            build
-          meson compile -C build
-      - name: Package
-        run: tar -C build/tests -czf /tmp/runner.tar.gz gum-tests data/
+          ./configure --host=$XTOOLS_HOST ${{ env.GUM_OPTIONS }}
+          make
+      - name: Upload Gum devkit
+        uses: actions/upload-artifact@v4
+        with:
+          name: gum-devkit-linux-${{ matrix.arch }}
+          path: build/gum/devkit/
+      - name: Upload GumJS devkit
+        uses: actions/upload-artifact@v4
+        with:
+          name: gumjs-devkit-linux-${{ matrix.arch }}
+          path: build/bindings/gumjs/devkit/
       - name: Test
-        uses: frida/corellium-action@v3
+        if: matrix.arch == 'x86' || matrix.arch == 'x86_64'
+        run: make test
+
+  mobile:
+    strategy:
+      matrix:
+        id:
+          - ios-arm64
+          - android-x86
+          - android-x86_64
+          - android-arm
+          - android-arm64
+      fail-fast: false
+    runs-on: ${{ startsWith(matrix.id, 'ios-') && 'macos-latest' || 'ubuntu-latest' }}
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: nttld/setup-ndk@v1
+        if: startsWith(matrix.id, 'android-')
+        id: setup-ndk
+        with:
+          ndk-version: r25
+          add-to-path: false
+      - name: Set ANDROID_NDK_ROOT
+        if: startsWith(matrix.id, 'android-')
+        run: echo "ANDROID_NDK_ROOT=${{ steps.setup-ndk.outputs.ndk-path }}" >> $GITHUB_ENV
+      - name: Build
+        run: |
+          ./configure --host=${{ matrix.id }} ${{ env.GUM_OPTIONS }}
+          make
+      - name: Upload Gum devkit
+        uses: actions/upload-artifact@v4
+        with:
+          name: gum-devkit-${{ matrix.id }}
+          path: build/gum/devkit/
+      - name: Upload GumJS devkit
+        uses: actions/upload-artifact@v4
+        with:
+          name: gumjs-devkit-${{ matrix.id }}
+          path: build/bindings/gumjs/devkit/
+      - name: Package tests
+        run: tar -C build/tests -czf /tmp/runner.tar.gz gum-tests data/
+      - name: Test on Corellium iOS device
+        if: matrix.id == 'ios-arm64'
+        continue-on-error: true
+        uses: frida/corellium-action@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           gateway: corellium.frida.re
-          device: ios-14.8-arm64
+          device: ios-12.5.7-arm64
           upload: /tmp/runner.tar.gz
           run: |
             cd /usr/local
@@ -264,104 +227,10 @@ jobs:
             cd opt/frida
             tar xf $ASSET_PATH
             ./gum-tests
-
-  android-intel:
-    runs-on: macos-10.15
-    strategy:
-      matrix:
-        arch: [x86, x86_64]
-      fail-fast: false
-    steps:
-      - name: Check out repo
-        uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '${{ env.PYTHON_VERSION }}'
-      - name: Install dependencies
-        run: |
-          pip install meson==${{ env.MESON_VERSION }}
-          .github/env/bootstrap.sh macos-x86_64 android-${{ matrix.arch }}
-      - name: Build
-        run: |
-          export PATH="/tmp/toolchain/bin:$PATH"
-          meson setup \
-            --native-file /tmp/native.txt \
-            --cross-file /tmp/cross.txt \
-            --default-library static \
-            -Doptimization=s \
-            -Dwerror=true \
-            -Dgumpp=enabled \
-            -Dgumjs=enabled \
-            -Dtests=enabled \
-            build
-          meson compile -C build
-      - name: AVD cache
-        uses: actions/cache@v2
-        id: avd-cache
-        with:
-          path: |
-            ~/.android/avd/*
-            ~/.android/adb*
-          key: avd-${{ matrix.arch }}
-      - name: Create AVD and generate snapshot for caching
-        if: steps.avd-cache.outputs.cache-hit != 'true'
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          arch: ${{ matrix.arch }}
-          api-level: 27
-          force-avd-creation: false
-          emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          disable-animations: false
-          script: echo "Generated AVD snapshot for caching."
-      - name: Test
-        uses: reactivecircus/android-emulator-runner@v2
-        with:
-          arch: ${{ matrix.arch }}
-          api-level: 27
-          force-avd-creation: false
-          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
-          disable-animations: true
-          script: |
-            gtar -C build/tests -czf /tmp/runner.tar.gz gum-tests data/
-            adb push /tmp/runner.tar.gz /data/local/tmp/
-            adb shell "su root sh -c 'set -ex; cd /data/local/tmp; tar xf runner.tar.gz; TMPDIR=/data/local/tmp ./gum-tests'"
-
-  android-arm:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        arch: [arm, arm64]
-      fail-fast: false
-    steps:
-      - name: Check out repo
-        uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '${{ env.PYTHON_VERSION }}'
-      - name: Install dependencies
-        run: |
-          pip install meson==${{ env.MESON_VERSION }}
-          .github/env/bootstrap.sh linux-x86_64 android-${{ matrix.arch }}
-      - name: Build
-        run: |
-          export PATH="/tmp/toolchain/bin:$PATH"
-          meson setup \
-            --native-file /tmp/native.txt \
-            --cross-file /tmp/cross.txt \
-            --default-library static \
-            -Doptimization=s \
-            -Dwerror=true \
-            -Dgumpp=enabled \
-            -Dgumjs=enabled \
-            -Dtests=enabled \
-            build
-          meson compile -C build
-      - name: Package
-        run: tar -C build/tests -czf /tmp/runner.tar.gz gum-tests data/
-      - name: Test
-        uses: frida/corellium-action@v3
+      - name: Test on Corellium Android device
+        if: matrix.id == 'android-arm64'
+        continue-on-error: true
+        uses: frida/corellium-action@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           gateway: corellium.frida.re
@@ -374,32 +243,27 @@ jobs:
 
   qnx-armeabi:
     runs-on: ubuntu-latest
-    container: fridadotre/qnx:latest
+    container: ghcr.io/frida/qnx-tools:latest
     steps:
       - name: Check out repo
-        uses: actions/checkout@v3
-      - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/checkout@v4
         with:
-          python-version: '${{ env.PYTHON_VERSION }}'
-      - name: Install dependencies
-        run: |
-          pip install meson==${{ env.MESON_VERSION }}
-          .github/env/bootstrap.sh linux-x86_64 qnx-armeabi
+          submodules: recursive
       - name: Build
         run: |
-          export PATH="/tmp/toolchain/bin:$PATH"
-          meson setup \
-            --native-file /tmp/native.txt \
-            --cross-file /tmp/cross.txt \
-            --default-library static \
-            -Doptimization=s \
-            -Dwerror=true \
-            -Dgumpp=enabled \
-            -Dgumjs=enabled \
-            -Dtests=enabled \
-            build
-          meson compile -C build
+          CFLAGS="--sysroot=$QNX_TARGET/armle-v7" \
+              ./configure --host=arm-unknown-nto-qnx6.5.0eabi ${{ env.GUM_OPTIONS }}
+          make
+      - name: Upload Gum devkit
+        uses: actions/upload-artifact@v4
+        with:
+          name: gum-devkit-qnx-armeabi
+          path: build/gum/devkit/
+      - name: Upload GumJS devkit
+        uses: actions/upload-artifact@v4
+        with:
+          name: gumjs-devkit-qnx-armeabi
+          path: build/bindings/gumjs/devkit/
       - name: Test
         run: |
           tar -C build/tests -cf /tmp/runner.tar gum-tests data/

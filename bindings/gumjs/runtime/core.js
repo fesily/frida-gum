@@ -1,6 +1,7 @@
 const Console = require('./console');
 const hexdump = require('./hexdump');
 const MessageDispatcher = require('./message-dispatcher');
+const Worker = require('./worker');
 
 const engine = global;
 let messageDispatcher;
@@ -106,6 +107,10 @@ Object.defineProperties(engine, {
     enumerable: true,
     value: hexdump
   },
+  Worker: {
+    enumerable: true,
+    value: Worker
+  },
   ObjC: {
     enumerable: true,
     configurable: true,
@@ -186,11 +191,6 @@ function makePointerWriteMethod(write) {
 function numberWrapperEquals(rhs) {
   return this.compare(rhs) === 0;
 }
-
-Script.load = async (name, source) => {
-  Script._load(name, source);
-  return await import(name);
-};
 
 const _nextTick = Script._nextTick;
 Script.nextTick = function (callback, ...args) {
@@ -279,76 +279,131 @@ Object.defineProperties(Memory, {
   }
 });
 
-makeEnumerateApi(Module, 'enumerateImports', 1);
-makeEnumerateApi(Module, 'enumerateExports', 1);
-makeEnumerateApi(Module, 'enumerateSymbols', 1);
-makeEnumerateApi(Module, 'enumerateRanges', 2);
+makeModuleEnumerateApi(Module, 'enumerateImports', 1);
+makeModuleEnumerateApi(Module, 'enumerateExports', 1);
+makeModuleEnumerateApi(Module, 'enumerateSymbols', 1);
+makeModuleEnumerateApi(Module, 'enumerateRanges', 2);
+makeModuleEnumerateApi(Module, 'enumerateSections', 1);
+makeModuleEnumerateApi(Module, 'enumerateDependencies', 1);
+
+function makeModuleEnumerateApi(mod, name, arity) {
+  Object.defineProperty(mod, name, {
+    enumerable: true,
+    value(...args) {
+      const module = Process.findModuleByName(args[0]);
+      if (module === null) {
+        const callbacks = args[arity];
+        if (callbacks !== undefined) {
+          callbacks.onComplete();
+          return;
+        }
+        return [];
+      }
+      return module[name].apply(module, args.slice(1));
+    }
+  });
+
+  Object.defineProperty(mod, name + 'Sync', {
+    enumerable: true,
+    value(moduleName, ...args) {
+      const module = Process.findModuleByName(moduleName);
+      if (module === null)
+        return [];
+      return module[name + 'Sync'].apply(module, args);
+    }
+  });
+}
 
 Object.defineProperties(Module, {
-  load: {
+  ensureInitialized: {
     enumerable: true,
-    value: function (moduleName) {
-      Module._load(moduleName);
-      return Process.getModuleByName(moduleName);
+    value(moduleName) {
+      Process.getModuleByName(moduleName).ensureInitialized();
+    }
+  },
+  findBaseAddress: {
+    enumerable: true,
+    value(moduleName) {
+      return Process.findModuleByName(moduleName)?.base ?? null;
     }
   },
   getBaseAddress: {
     enumerable: true,
-    value: function (moduleName) {
-      const base = Module.findBaseAddress(moduleName);
-      if (base === null)
-        throw new Error("unable to find module '" + moduleName + "'");
-      return base;
+    value(moduleName) {
+      return Process.getModuleByName(moduleName)?.base ?? null;
+    }
+  },
+  findExportByName: {
+    enumerable: true,
+    value(moduleName, symbolName) {
+      if (moduleName === null)
+        return Module.findGlobalExportByName(symbolName);
+      return Process.findModuleByName(moduleName)?.findExportByName(symbolName) ?? null;
     }
   },
   getExportByName: {
     enumerable: true,
-    value: function (moduleName, symbolName) {
+    value(moduleName, symbolName) {
       const address = Module.findExportByName(moduleName, symbolName);
       if (address === null) {
         const prefix = (moduleName !== null) ? (moduleName + ': ') : '';
-        throw new Error(prefix + "unable to find export '" + symbolName + "'");
+        throw new Error(`${prefix}unable to find export '${symbolName}'`);
+      }
+      return address;
+    }
+  },
+  findSymbolByName: {
+    enumerable: true,
+    value(moduleName, symbolName) {
+      return Process.findModuleByName(moduleName)?.findSymbolByName(symbolName) ?? null;
+    }
+  },
+  getSymbolByName: {
+    enumerable: true,
+    value(moduleName, symbolName) {
+      const address = Module.findSymbolByName(moduleName, symbolName);
+      if (address === null) {
+        const prefix = (moduleName !== null) ? (moduleName + ': ') : '';
+        throw new Error(`${prefix}unable to find symbol '${symbolName}'`);
       }
       return address;
     }
   },
 });
 
-Object.defineProperties(Module.prototype, {
-  enumerateImports: {
-    enumerable: true,
-    value: function () {
-      return Module.enumerateImports(this.path);
-    }
-  },
-  enumerateExports: {
-    enumerable: true,
-    value: function () {
-      return Module.enumerateExports(this.path);
-    }
-  },
-  enumerateSymbols: {
-    enumerable: true,
-    value: function () {
-      return Module.enumerateSymbols(this.path);
-    }
-  },
-  enumerateRanges: {
-    enumerable: true,
-    value: function (protection) {
-      return Module.enumerateRanges(this.path, protection);
-    }
-  },
-  findExportByName: {
-    enumerable: true,
-    value: function (exportName) {
-      return Module.findExportByName(this.path, exportName);
-    }
-  },
+const moduleProto = Module.prototype;
+
+makeEnumerateApi(moduleProto, 'enumerateImports', 1);
+makeEnumerateApi(moduleProto, 'enumerateExports', 1);
+makeEnumerateApi(moduleProto, 'enumerateSymbols', 1);
+makeEnumerateApi(moduleProto, 'enumerateRanges', 2);
+makeEnumerateApi(moduleProto, 'enumerateSections', 1);
+makeEnumerateApi(moduleProto, 'enumerateDependencies', 1);
+
+Object.defineProperties(moduleProto, {
   getExportByName: {
     enumerable: true,
-    value: function (exportName) {
-      return Module.getExportByName(this.path, exportName);
+    value(symbolName) {
+      const address = this.findExportByName(symbolName);
+      if (address === null)
+        throw new Error(`${this.path}: unable to find export '${symbolName}'`);
+      return address;
+    }
+  },
+  getSymbolByName: {
+    enumerable: true,
+    value(symbolName) {
+      const address = this.findSymbolByName(symbolName);
+      if (address === null)
+        throw new Error(`${this.path}: unable to find export '${symbolName}'`);
+      return address;
+    }
+  },
+  toJSON: {
+    enumerable: true,
+    value() {
+      const {name, base, size, path} = this;
+      return {name, base, size, path};
     }
   },
 });
@@ -389,23 +444,19 @@ makeEnumerateRanges(Process);
 makeEnumerateApi(Process, 'enumerateMallocRanges', 0);
 
 Object.defineProperties(Process, {
-  findModuleByAddress: {
+  runOnThread: {
     enumerable: true,
-    value: function (address) {
-      let module = null;
-      Process._enumerateModules({
-        onMatch(m) {
-          const base = m.base;
-          if (base.compare(address) <= 0 && base.add(m.size).compare(address) > 0) {
-            module = m;
-            return 'stop';
+    value: function (threadId, callback) {
+      return new Promise((resolve, reject) => {
+        Process._runOnThread(threadId, () => {
+          try {
+            resolve(callback());
+          } catch (e) {
+            reject(e);
           }
-        },
-        onComplete() {
-        }
+        });
       });
-      return module;
-    }
+    },
   },
   getModuleByAddress: {
     enumerable: true,
@@ -457,99 +508,128 @@ if (Process.findRangeByAddress === undefined) {
   });
 }
 
-Object.defineProperties(Interceptor, {
-  attach: {
+Object.defineProperties(Thread, {
+  backtrace: {
     enumerable: true,
-    value: function (target, callbacks, data) {
-      Memory._checkCodePointer(target);
-      return Interceptor._attach(target, callbacks, data);
-    }
-  },
-  replace: {
-    enumerable: true,
-    value: function (target, replacement, data) {
-      Memory._checkCodePointer(target);
-      Interceptor._replace(target, replacement, data);
+    value: function (cpuContext = null, backtracerOrOptions = {}) {
+      const options = (typeof backtracerOrOptions === 'object')
+          ? backtracerOrOptions
+          : { backtracer: backtracerOrOptions };
+
+      const {
+        backtracer = Backtracer.ACCURATE,
+        limit = 0,
+      } = options;
+
+      return Thread._backtrace(cpuContext, backtracer, limit);
     }
   },
 });
 
-const stalkerEventType = {
-  call: 1,
-  ret: 2,
-  exec: 4,
-  block: 8,
-  compile: 16,
-};
-
-Object.defineProperties(Stalker, {
-  exclude: {
-    enumerable: true,
-    value: function (range) {
-      Stalker._exclude(range.base, range.size);
-    }
-  },
-  follow: {
-    enumerable: true,
-    value: function (first, second) {
-      let threadId = first;
-      let options = second;
-
-      if (typeof first === 'object') {
-        threadId = undefined;
-        options = first;
+if (globalThis.Interceptor !== undefined) {
+  Object.defineProperties(Interceptor, {
+    attach: {
+      enumerable: true,
+      value: function (target, callbacks, data) {
+        Memory._checkCodePointer(target);
+        return Interceptor._attach(target, callbacks, data);
       }
+    },
+    replace: {
+      enumerable: true,
+      value: function (target, replacement, data) {
+        Memory._checkCodePointer(target);
+        Interceptor._replace(target, replacement, data);
+      }
+    },
+    replaceFast: {
+      enumerable: true,
+      value: function (target, replacement) {
+        Memory._checkCodePointer(target);
+        return Interceptor._replaceFast(target, replacement);
+      }
+    },
+  });
+}
 
-      if (threadId === undefined)
-        threadId = Process.getCurrentThreadId();
-      if (options === undefined)
-        options = {};
+if (globalThis.Stalker !== undefined) {
+  const stalkerEventType = {
+    call: 1,
+    ret: 2,
+    exec: 4,
+    block: 8,
+    compile: 16,
+  };
 
-      if (typeof threadId !== 'number' || (options === null || typeof options !== 'object'))
-        throw new Error('invalid argument');
+  Object.defineProperties(Stalker, {
+    exclude: {
+      enumerable: true,
+      value: function (range) {
+        Stalker._exclude(range.base, range.size);
+      }
+    },
+    follow: {
+      enumerable: true,
+      value: function (first, second) {
+        let threadId = first;
+        let options = second;
 
-      const {
-        transform = null,
-        events = {},
-        onReceive = null,
-        onCallSummary = null,
-        onEvent = NULL,
-        data = NULL,
-      } = options;
+        if (typeof first === 'object') {
+          threadId = undefined;
+          options = first;
+        }
 
-      if (events === null || typeof events !== 'object')
-        throw new Error('events must be an object');
+        if (threadId === undefined)
+          threadId = Process.getCurrentThreadId();
+        if (options === undefined)
+          options = {};
 
-      if (!data.isNull() && (onReceive !== null || onCallSummary !== null))
-        throw new Error('onEvent precludes passing onReceive/onCallSummary');
+        if (typeof threadId !== 'number' || (options === null || typeof options !== 'object'))
+          throw new Error('invalid argument');
 
-      const eventMask = Object.keys(events).reduce((result, name) => {
-        const value = stalkerEventType[name];
-        if (value === undefined)
-          throw new Error(`unknown event type: ${name}`);
+        const {
+          transform = null,
+          events = {},
+          onReceive = null,
+          onCallSummary = null,
+          onEvent = NULL,
+          data = NULL,
+        } = options;
 
-        const enabled = events[name];
-        if (typeof enabled !== 'boolean')
-          throw new Error('desired events must be specified as boolean values');
+        if (events === null || typeof events !== 'object')
+          throw new Error('events must be an object');
 
-        return enabled ? (result | value) : result;
-      }, 0);
+        if (!data.isNull() && (onReceive !== null || onCallSummary !== null))
+          throw new Error('onEvent precludes passing onReceive/onCallSummary');
 
-      Stalker._follow(threadId, transform, eventMask, onReceive, onCallSummary, onEvent, data);
+        const eventMask = Object.keys(events).reduce((result, name) => {
+          const value = stalkerEventType[name];
+          if (value === undefined)
+            throw new Error(`unknown event type: ${name}`);
+
+          const enabled = events[name];
+          if (typeof enabled !== 'boolean')
+            throw new Error('desired events must be specified as boolean values');
+
+          return enabled ? (result | value) : result;
+        }, 0);
+
+        Stalker._follow(threadId, transform, eventMask, onReceive, onCallSummary, onEvent, data);
+      }
+    },
+    parse: {
+      enumerable: true,
+      value: function (events, options = {}) {
+        const {
+          annotate = true,
+          stringify = false
+        } = options;
+
+        return Stalker._parse(events, annotate, stringify);
+      }
     }
-  },
-  parse: {
-    enumerable: true,
-    value: function (events, options = {}) {
-      const {
-        annotate = true,
-        stringify = false
-      } = options;
-
-      return Stalker._parse(events, annotate, stringify);
-    }
-  }
-});
+  });
+}
 
 Object.defineProperty(Instruction, 'parse', {
   enumerable: true,
@@ -808,6 +888,33 @@ if (engine.SqliteDatabase !== undefined) {
     }
   });
 }
+
+Object.defineProperties(Cloak, {
+  hasCurrentThread: {
+    enumerable: true,
+    value() {
+      return Cloak.hasThread(Process.getCurrentThreadId());
+    }
+  },
+  addRange: {
+    enumerable: true,
+    value(range) {
+      Cloak._addRange(range.base, range.size);
+    }
+  },
+  removeRange: {
+    enumerable: true,
+    value(range) {
+      Cloak._removeRange(range.base, range.size);
+    }
+  },
+  clipRange: {
+    enumerable: true,
+    value(range) {
+      return Cloak._clipRange(range.base, range.size);
+    }
+  },
+});
 
 function makeEnumerateApi(mod, name, arity) {
   const impl = mod['_' + name];

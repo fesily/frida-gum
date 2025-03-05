@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2020 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2020-2025 Ole André Vadla Ravnås <oleavr@nowsecure.com>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -130,13 +130,6 @@ struct _GumQuickInvocationState
   GumQuickInvocationContext * jic;
 };
 
-struct _GumQuickInvocationArgs
-{
-  JSValue wrapper;
-  GumInvocationContext * ic;
-  JSContext * ctx;
-};
-
 struct _GumQuickInvocationRetval
 {
   GumQuickNativePointer native_pointer;
@@ -164,7 +157,11 @@ static void gum_quick_interceptor_detach (GumQuickInterceptor * self,
     GumQuickInvocationListener * listener);
 GUMJS_DECLARE_FUNCTION (gumjs_interceptor_detach_all)
 GUMJS_DECLARE_FUNCTION (gumjs_interceptor_replace)
-static void gum_quick_replace_entry_free (GumQuickReplaceEntry * entry);
+GUMJS_DECLARE_FUNCTION (gumjs_interceptor_replace_fast)
+static void gum_quick_add_replace_entry (GumQuickInterceptor * self,
+    gpointer target, JSValue replacement_value);
+static JSValue gum_quick_handle_replace_ret (JSContext * ctx, gpointer target,
+    GumReplaceReturn replace_ret);
 static void gum_quick_replace_entry_revert_and_free (
     GumQuickReplaceEntry * entry);
 GUMJS_DECLARE_FUNCTION (gumjs_interceptor_revert)
@@ -249,8 +246,6 @@ GUMJS_DECLARE_GETTER (gumjs_invocation_context_get_depth)
 static JSValue gum_quick_invocation_args_new (GumQuickInterceptor * parent,
     GumQuickInvocationArgs ** args);
 static void gum_quick_invocation_args_release (GumQuickInvocationArgs * self);
-static void gum_quick_invocation_args_reset (GumQuickInvocationArgs * self,
-    GumInvocationContext * ic);
 GUMJS_DECLARE_FINALIZER (gumjs_invocation_args_finalize)
 static JSValue gumjs_invocation_args_get_property (JSContext * ctx,
     JSValueConst obj, JSAtom atom, JSValueConst receiver);
@@ -270,12 +265,8 @@ GUMJS_DECLARE_FUNCTION (gumjs_invocation_retval_replace)
 static void gum_quick_interceptor_check_invocation_context (
     GumQuickInterceptor * self, GumQuickInvocationContext * jic,
     gboolean * jic_is_dirty);
-static GumQuickInvocationArgs * gum_quick_interceptor_obtain_invocation_args (
-    GumQuickInterceptor * self);
-static void gum_quick_interceptor_release_invocation_args (
-    GumQuickInterceptor * self, GumQuickInvocationArgs * args);
 static GumQuickInvocationRetval *
-gum_quick_interceptor_obtain_invocation_retval (GumQuickInterceptor * self);
+    gum_quick_interceptor_obtain_invocation_retval (GumQuickInterceptor * self);
 static void gum_quick_interceptor_release_invocation_retval (
     GumQuickInterceptor * self, GumQuickInvocationRetval * retval);
 
@@ -284,6 +275,7 @@ static const JSCFunctionListEntry gumjs_interceptor_entries[] =
   JS_CFUNC_DEF ("_attach", 3, gumjs_interceptor_attach),
   JS_CFUNC_DEF ("detachAll", 0, gumjs_interceptor_detach_all),
   JS_CFUNC_DEF ("_replace", 0, gumjs_interceptor_replace),
+  JS_CFUNC_DEF ("_replaceFast", 0, gumjs_interceptor_replace_fast),
   JS_CFUNC_DEF ("revert", 0, gumjs_interceptor_revert),
   JS_CFUNC_DEF ("flush", 0, gumjs_interceptor_flush),
 };
@@ -643,20 +635,64 @@ GUMJS_DEFINE_FUNCTION (gumjs_interceptor_replace)
   GumQuickInterceptor * self;
   gpointer target, replacement_function, replacement_data;
   JSValue replacement_value;
-  GumQuickReplaceEntry * entry = NULL;
   GumReplaceReturn replace_ret;
-  GumQuickNativeCallback * c;
 
   self = gumjs_get_parent_module (core);
 
   replacement_data = NULL;
   if (!_gum_quick_args_parse (args, "pO|p", &target, &replacement_value,
       &replacement_data))
-    goto propagate_exception;
+    return JS_EXCEPTION;
 
   if (!_gum_quick_native_pointer_get (ctx, replacement_value, core,
       &replacement_function))
-    goto propagate_exception;
+    return JS_EXCEPTION;
+
+  replace_ret = gum_interceptor_replace (self->interceptor, target,
+      replacement_function, replacement_data, NULL);
+  if (replace_ret != GUM_REPLACE_OK)
+    return gum_quick_handle_replace_ret (ctx, target, replace_ret);
+
+  gum_quick_add_replace_entry (self, target, replacement_value);
+
+  return JS_UNDEFINED;
+}
+
+GUMJS_DEFINE_FUNCTION (gumjs_interceptor_replace_fast)
+{
+  GumQuickInterceptor * self;
+  gpointer target, replacement_function, original_function;
+  JSValue replacement_value;
+  GumReplaceReturn replace_ret;
+
+  self = gumjs_get_parent_module (core);
+
+  if (!_gum_quick_args_parse (args, "pO", &target, &replacement_value))
+    return JS_EXCEPTION;
+
+  if (!_gum_quick_native_pointer_get (ctx, replacement_value, core,
+      &replacement_function))
+    return JS_EXCEPTION;
+
+  replace_ret = gum_interceptor_replace_fast (self->interceptor, target,
+      replacement_function, &original_function);
+  if (replace_ret != GUM_REPLACE_OK)
+    return gum_quick_handle_replace_ret (ctx, target, replace_ret);
+
+  gum_quick_add_replace_entry (self, target, replacement_value);
+
+  return _gum_quick_native_pointer_new (ctx,
+      GSIZE_TO_POINTER (original_function), core);
+}
+
+static void
+gum_quick_add_replace_entry (GumQuickInterceptor * self,
+                             gpointer target,
+                             JSValue replacement_value)
+{
+  GumQuickCore * core = self->core;
+  JSContext * ctx = core->ctx;
+  GumQuickReplaceEntry * entry;
 
   entry = g_slice_new (GumQuickReplaceEntry);
   entry->interceptor = self->interceptor;
@@ -664,48 +700,34 @@ GUMJS_DEFINE_FUNCTION (gumjs_interceptor_replace)
   entry->replacement = JS_DupValue (ctx, replacement_value);
   entry->ctx = ctx;
 
-  replace_ret = gum_interceptor_replace (self->interceptor, target,
-      replacement_function, replacement_data, NULL);
-  if (replace_ret != GUM_REPLACE_OK)
-    goto unable_to_replace;
-
-  c = JS_GetOpaque (entry->replacement, core->native_callback_class);
-  if (c != NULL)
-    c->interceptor_replacement_count++;
-
   g_hash_table_insert (self->replacement_by_address, target, entry);
+}
 
-  return JS_UNDEFINED;
-
-unable_to_replace:
+static JSValue
+gum_quick_handle_replace_ret (JSContext * ctx,
+                              gpointer target,
+                              GumReplaceReturn replace_ret)
+{
+  switch (replace_ret)
   {
-    switch (replace_ret)
-    {
-      case GUM_REPLACE_WRONG_SIGNATURE:
-        _gum_quick_throw (ctx, "unable to intercept function at %p; "
-            "please file a bug", target);
-        break;
-      case GUM_REPLACE_ALREADY_REPLACED:
-        _gum_quick_throw_literal (ctx, "already replaced this function");
-        break;
-      case GUM_REPLACE_POLICY_VIOLATION:
-        _gum_quick_throw_literal (ctx, "not permitted by code-signing policy");
-        break;
-      case GUM_REPLACE_WRONG_TYPE:
-        _gum_quick_throw_literal (ctx, "wrong type");
-        break;
-      default:
-        g_assert_not_reached ();
-    }
-
-    goto propagate_exception;
+    case GUM_REPLACE_WRONG_SIGNATURE:
+      _gum_quick_throw (ctx, "unable to intercept function at %p; "
+          "please file a bug", target);
+      break;
+    case GUM_REPLACE_ALREADY_REPLACED:
+      _gum_quick_throw_literal (ctx, "already replaced this function");
+      break;
+    case GUM_REPLACE_POLICY_VIOLATION:
+      _gum_quick_throw_literal (ctx, "not permitted by code-signing policy");
+      break;
+    case GUM_REPLACE_WRONG_TYPE:
+      _gum_quick_throw_literal (ctx, "wrong type");
+      break;
+    default:
+      g_assert_not_reached ();
   }
-propagate_exception:
-  {
-    gum_quick_replace_entry_free (entry);
 
-    return JS_EXCEPTION;
-  }
+  return JS_EXCEPTION;
 }
 
 static void
@@ -731,21 +753,11 @@ GUMJS_DEFINE_FUNCTION (gumjs_interceptor_revert)
 {
   GumQuickInterceptor * self;
   gpointer target;
-  GumQuickReplaceEntry * entry;
 
   self = gumjs_get_parent_module (core);
 
   if (!_gum_quick_args_parse (args, "p", &target))
     return JS_EXCEPTION;
-
-  entry = g_hash_table_lookup (self->replacement_by_address, target);
-  if (entry != NULL)
-  {
-    GumQuickNativeCallback * c =
-        JS_GetOpaque (entry->replacement, core->native_callback_class);
-    if (c != NULL)
-      c->interceptor_replacement_count--;
-  }
 
   g_hash_table_remove (self->replacement_by_address, target);
 
@@ -892,14 +904,14 @@ gum_quick_js_call_listener_on_enter (GumInvocationListener * listener,
     jic = _gum_quick_interceptor_obtain_invocation_context (parent);
     _gum_quick_invocation_context_reset (jic, ic);
 
-    args = gum_quick_interceptor_obtain_invocation_args (parent);
-    gum_quick_invocation_args_reset (args, ic);
+    args = _gum_quick_interceptor_obtain_invocation_args (parent);
+    _gum_quick_invocation_args_reset (args, ic);
 
     _gum_quick_scope_call_void (&scope, self->on_enter, jic->wrapper, 1,
         &args->wrapper);
 
-    gum_quick_invocation_args_reset (args, NULL);
-    gum_quick_interceptor_release_invocation_args (parent, args);
+    _gum_quick_invocation_args_reset (args, NULL);
+    _gum_quick_interceptor_release_invocation_args (parent, args);
 
     _gum_quick_invocation_context_reset (jic, NULL);
     gum_quick_interceptor_check_invocation_context (parent, jic, &jic_is_dirty);
@@ -1042,14 +1054,14 @@ gum_quick_js_probe_listener_on_enter (GumInvocationListener * listener,
   jic = _gum_quick_interceptor_obtain_invocation_context (parent);
   _gum_quick_invocation_context_reset (jic, ic);
 
-  args = gum_quick_interceptor_obtain_invocation_args (parent);
-  gum_quick_invocation_args_reset (args, ic);
+  args = _gum_quick_interceptor_obtain_invocation_args (parent);
+  _gum_quick_invocation_args_reset (args, ic);
 
   _gum_quick_scope_call_void (&scope, self->on_hit, jic->wrapper, 1,
       &args->wrapper);
 
-  gum_quick_invocation_args_reset (args, NULL);
-  gum_quick_interceptor_release_invocation_args (parent, args);
+  _gum_quick_invocation_args_reset (args, NULL);
+  _gum_quick_interceptor_release_invocation_args (parent, args);
 
   _gum_quick_invocation_context_reset (jic, NULL);
   _gum_quick_interceptor_release_invocation_context (parent, jic);
@@ -1344,9 +1356,9 @@ gum_quick_invocation_args_release (GumQuickInvocationArgs * self)
   JS_FreeValue (self->ctx, self->wrapper);
 }
 
-static void
-gum_quick_invocation_args_reset (GumQuickInvocationArgs * self,
-                                 GumInvocationContext * ic)
+void
+_gum_quick_invocation_args_reset (GumQuickInvocationArgs * self,
+                                  GumInvocationContext * ic)
 {
   self->ic = ic;
 }
@@ -1632,8 +1644,8 @@ gum_quick_interceptor_check_invocation_context (GumQuickInterceptor * self,
     *jic_is_dirty = is_dirty;
 }
 
-static GumQuickInvocationArgs *
-gum_quick_interceptor_obtain_invocation_args (GumQuickInterceptor * self)
+GumQuickInvocationArgs *
+_gum_quick_interceptor_obtain_invocation_args (GumQuickInterceptor * self)
 {
   GumQuickInvocationArgs * args;
 
@@ -1650,9 +1662,9 @@ gum_quick_interceptor_obtain_invocation_args (GumQuickInterceptor * self)
   return args;
 }
 
-static void
-gum_quick_interceptor_release_invocation_args (GumQuickInterceptor * self,
-                                               GumQuickInvocationArgs * args)
+void
+_gum_quick_interceptor_release_invocation_args (GumQuickInterceptor * self,
+                                                GumQuickInvocationArgs * args)
 {
   if (args == self->cached_invocation_args)
     self->cached_invocation_args_in_use = FALSE;

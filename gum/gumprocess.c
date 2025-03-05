@@ -1,17 +1,26 @@
 /*
- * Copyright (C) 2015-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2015-2025 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2023-2024 Francesco Tamagni <mrmacete@protonmail.ch>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
 
 #include "gumprocess-priv.h"
 
+#include "gum-init.h"
 #include "gumcloak.h"
+#include "gummoduleregistry.h"
+
+#ifndef HAVE_WINDOWS
+# define GUM_OS_LACKS_MODULE_LOOKUP_APIS 1
+#endif
 
 typedef struct _GumEmitThreadsContext GumEmitThreadsContext;
-typedef struct _GumResolveModulePointerContext GumResolveModulePointerContext;
+#ifdef GUM_OS_LACKS_MODULE_LOOKUP_APIS
+typedef struct _GumFindModuleByNameContext GumFindModuleByNameContext;
+typedef struct _GumFindModuleByAddressContext GumFindModuleByAddressContext;
+#endif
 typedef struct _GumEmitRangesContext GumEmitRangesContext;
-typedef struct _GumResolveSymbolContext GumResolveSymbolContext;
 
 struct _GumEmitThreadsContext
 {
@@ -19,13 +28,19 @@ struct _GumEmitThreadsContext
   gpointer user_data;
 };
 
-struct _GumResolveModulePointerContext
+#ifdef GUM_OS_LACKS_MODULE_LOOKUP_APIS
+struct _GumFindModuleByNameContext
 {
-  gconstpointer ptr;
-  gboolean success;
-  gchar ** path;
-  GumMemoryRange * range;
+  const gchar * name;
+  GumModule * module;
 };
+
+struct _GumFindModuleByAddressContext
+{
+  GumAddress address;
+  GumModule * module;
+};
+#endif
 
 struct _GumEmitRangesContext
 {
@@ -33,25 +48,26 @@ struct _GumEmitRangesContext
   gpointer user_data;
 };
 
-struct _GumResolveSymbolContext
-{
-  const gchar * name;
-  GumAddress result;
-};
-
 static gboolean gum_emit_thread_if_not_cloaked (
     const GumThreadDetails * details, gpointer user_data);
-static gboolean gum_try_resolve_module_pointer_from (
-    const GumModuleDetails * details, gpointer user_data);
+static void gum_deinit_main_module (void);
+#ifdef GUM_OS_LACKS_MODULE_LOOKUP_APIS
+static gboolean gum_try_resolve_module_by_name (GumModule * module,
+    gpointer user_data);
+static gboolean gum_try_resolve_module_by_path (GumModule * module,
+    gpointer user_data);
+static gboolean gum_try_resolve_module_by_address (GumModule * module,
+    gpointer user_data);
+#endif
 static gboolean gum_emit_range_if_not_cloaked (const GumRangeDetails * details,
     gpointer user_data);
-static gboolean gum_store_address_if_name_matches (
-    const GumSymbolDetails * details, gpointer user_data);
 
+static GumTeardownRequirement gum_teardown_requirement =
+    GUM_TEARDOWN_REQUIREMENT_FULL;
 static GumCodeSigningPolicy gum_code_signing_policy = GUM_CODE_SIGNING_OPTIONAL;
 
-GUM_DEFINE_BOXED_TYPE (GumModuleDetails, gum_module_details,
-                       gum_module_details_copy, gum_module_details_free)
+G_DEFINE_BOXED_TYPE (GumThreadDetails, gum_thread_details,
+                     gum_thread_details_copy, gum_thread_details_free)
 
 GumOS
 gum_process_get_native_os (void)
@@ -79,6 +95,18 @@ gum_process_get_native_os (void)
 #endif
 }
 
+GumTeardownRequirement
+gum_process_get_teardown_requirement (void)
+{
+  return gum_teardown_requirement;
+}
+
+void
+gum_process_set_teardown_requirement (GumTeardownRequirement requirement)
+{
+  gum_teardown_requirement = requirement;
+}
+
 GumCodeSigningPolicy
 gum_process_get_code_signing_policy (void)
 {
@@ -96,6 +124,7 @@ gum_process_set_code_signing_policy (GumCodeSigningPolicy policy)
  * @thread_id: ID of thread to modify
  * @func: (scope call): function to apply the modifications
  * @user_data: data to pass to @func
+ * @flags: flags to customize behavior
  *
  * Modifies a given thread by first pausing it, reading its state, and then
  * passing that to @func, followed by writing back the new state and then
@@ -137,62 +166,150 @@ gum_emit_thread_if_not_cloaked (const GumThreadDetails * details,
 }
 
 /**
- * gum_process_resolve_module_pointer:
- * @ptr: memory location potentially belonging to a module
- * @path: (out) (optional): absolute path of module
- * @range: (out caller-allocates) (optional): memory range of module
+ * gum_process_get_main_module:
  *
- * Determines which module @ptr belongs to, if any.
- *
- * Returns: whether the pointer resolved to a module
+ * Returns module representing the main executable of the process.
  */
-gboolean
-gum_process_resolve_module_pointer (gconstpointer ptr,
-                                    gchar ** path,
-                                    GumMemoryRange * range)
+GumModule *
+gum_process_get_main_module (void)
 {
-  GumResolveModulePointerContext ctx = {
-    .ptr = ptr,
-    .success = FALSE,
-    .path = path,
-    .range = range
+  static gsize cached_result = 0;
+
+  if (g_once_init_enter (&cached_result))
+  {
+    GumModule * result;
+
+    gum_process_enumerate_modules (_gum_process_collect_main_module, &result);
+
+    _gum_register_destructor (gum_deinit_main_module);
+
+    g_once_init_leave (&cached_result, GPOINTER_TO_SIZE (result) + 1);
+  }
+
+  return GSIZE_TO_POINTER (cached_result - 1);
+}
+
+static void
+gum_deinit_main_module (void)
+{
+  g_object_unref (gum_process_get_main_module ());
+}
+
+/**
+ * gum_process_find_module_by_name:
+ * @name: name of a currently loaded module
+ *
+ * Finds a currently loaded module by name or filesystem path.
+ *
+ * Returns: (transfer full) (nullable): module matching @name, or %NULL if none
+ *   was found
+ */
+#ifdef GUM_OS_LACKS_MODULE_LOOKUP_APIS
+GumModule *
+gum_process_find_module_by_name (const gchar * name)
+{
+  GumFindModuleByNameContext ctx = {
+    .name = name,
+    .module = NULL
   };
 
-  gum_process_enumerate_modules (gum_try_resolve_module_pointer_from, &ctx);
+  if (g_path_is_absolute (name))
+    gum_process_enumerate_modules (gum_try_resolve_module_by_path, &ctx);
+  else
+    gum_process_enumerate_modules (gum_try_resolve_module_by_name, &ctx);
 
-  return ctx.success;
+  return ctx.module;
 }
 
 static gboolean
-gum_try_resolve_module_pointer_from (const GumModuleDetails * details,
-                                     gpointer user_data)
+gum_try_resolve_module_by_name (GumModule * module,
+                                gpointer user_data)
 {
-  GumResolveModulePointerContext * ctx = user_data;
+  GumFindModuleByNameContext * ctx = user_data;
 
-  if (GUM_MEMORY_RANGE_INCLUDES (details->range, GUM_ADDRESS (ctx->ptr)))
+  if (strcmp (gum_module_get_name (module), ctx->name) == 0)
   {
-    ctx->success = TRUE;
-
-    if (ctx->path != NULL)
-      *ctx->path = g_strdup (details->path);
-
-    if (ctx->range != NULL)
-      *ctx->range = *details->range;
-
+    ctx->module = g_object_ref (module);
     return FALSE;
   }
 
   return TRUE;
 }
 
+static gboolean
+gum_try_resolve_module_by_path (GumModule * module,
+                                gpointer user_data)
+{
+  GumFindModuleByNameContext * ctx = user_data;
+
+  if (strcmp (gum_module_get_path (module), ctx->name) == 0)
+  {
+    ctx->module = g_object_ref (module);
+    return FALSE;
+  }
+
+  return TRUE;
+}
+#endif
+
+/**
+ * gum_process_find_module_by_address:
+ * @address: memory address potentially belonging to a module
+ *
+ * Determines which module @address belongs to, if any. Note that #ModuleMap is
+ * more efficient for repeated lookups.
+ *
+ * Returns: (transfer full) (nullable): module containing @address, or %NULL if
+ *   none was found
+ */
+#ifdef GUM_OS_LACKS_MODULE_LOOKUP_APIS
+GumModule *
+gum_process_find_module_by_address (GumAddress address)
+{
+  GumFindModuleByAddressContext ctx = {
+    .address = address,
+    .module = NULL
+  };
+
+  gum_process_enumerate_modules (gum_try_resolve_module_by_address, &ctx);
+
+  return ctx.module;
+}
+
+static gboolean
+gum_try_resolve_module_by_address (GumModule * module,
+                                   gpointer user_data)
+{
+  GumFindModuleByAddressContext * ctx = user_data;
+  const GumMemoryRange * range;
+
+  range = gum_module_get_range (module);
+
+  if (GUM_MEMORY_RANGE_INCLUDES (range, ctx->address))
+  {
+    ctx->module = g_object_ref (module);
+    return FALSE;
+  }
+
+  return TRUE;
+}
+#endif
+
 /**
  * gum_process_enumerate_modules:
- * @func: (scope call): function called with #GumModuleDetails
+ * @func: (scope call): function called with #GumModule
  * @user_data: data to pass to @func
  *
- * Enumerates modules loaded right now, calling @func with #GumModuleDetails
- * about each module found.
+ * Enumerates modules loaded right now, calling @func with each #GumModule
+ * found.
  */
+void
+gum_process_enumerate_modules (GumFoundModuleFunc func,
+                               gpointer user_data)
+{
+  gum_module_registry_enumerate_modules (gum_module_registry_obtain (), func,
+      user_data);
+}
 
 /**
  * gum_process_enumerate_ranges:
@@ -258,7 +375,7 @@ gum_emit_range_if_not_cloaked (const GumRangeDetails * details,
 
 /**
  * gum_module_enumerate_imports:
- * @module_name: name of module
+ * @module: module
  * @func: (scope call): function called with #GumImportDetails
  * @user_data: data to pass to @func
  *
@@ -268,7 +385,7 @@ gum_emit_range_if_not_cloaked (const GumRangeDetails * details,
 
 /**
  * gum_module_enumerate_exports:
- * @module_name: name of module
+ * @module: module
  * @func: (scope call): function called with #GumExportDetails
  * @user_data: data to pass to @func
  *
@@ -278,7 +395,7 @@ gum_emit_range_if_not_cloaked (const GumRangeDetails * details,
 
 /**
  * gum_module_enumerate_symbols:
- * @module_name: name of module
+ * @module: module
  * @func: (scope call): function called with #GumSymbolDetails
  * @user_data: data to pass to @func
  *
@@ -288,7 +405,7 @@ gum_emit_range_if_not_cloaked (const GumRangeDetails * details,
 
 /**
  * gum_module_enumerate_ranges:
- * @module_name: name of module
+ * @self: module
  * @prot: bitfield specifying the minimum protection
  * @func: (scope call): function called with #GumRangeDetails
  * @user_data: data to pass to @func
@@ -296,37 +413,6 @@ gum_emit_range_if_not_cloaked (const GumRangeDetails * details,
  * Enumerates memory ranges of the specified module that satisfy @prot,
  * calling @func with #GumRangeDetails about each such range found.
  */
-
-GumAddress
-gum_module_find_symbol_by_name (const gchar * module_name,
-                                const gchar * symbol_name)
-{
-  GumResolveSymbolContext ctx;
-
-  ctx.name = symbol_name;
-  ctx.result = 0;
-
-  gum_module_enumerate_symbols (module_name, gum_store_address_if_name_matches,
-      &ctx);
-
-  return ctx.result;
-}
-
-static gboolean
-gum_store_address_if_name_matches (const GumSymbolDetails * details,
-                                   gpointer user_data)
-{
-  GumResolveSymbolContext * ctx = user_data;
-  gboolean carry_on = TRUE;
-
-  if (strcmp (details->name, ctx->name) == 0)
-  {
-    ctx->result = details->address;
-    carry_on = FALSE;
-  }
-
-  return carry_on;
-}
 
 const gchar *
 gum_code_signing_policy_to_string (GumCodeSigningPolicy policy)
@@ -341,56 +427,20 @@ gum_code_signing_policy_to_string (GumCodeSigningPolicy policy)
   return NULL;
 }
 
-GumModuleDetails *
-gum_module_details_copy (const GumModuleDetails * module)
+GumThreadDetails *
+gum_thread_details_copy (const GumThreadDetails * details)
 {
-  GumModuleDetails * copy;
+  GumThreadDetails * d;
 
-  copy = g_slice_new (GumModuleDetails);
+  d = g_slice_dup (GumThreadDetails, details);
+  d->name = g_strdup (details->name);
 
-  copy->name = g_strdup (module->name);
-  copy->range = gum_memory_range_copy (module->range);
-  copy->path = g_strdup (module->path);
-
-  return copy;
+  return d;
 }
 
 void
-gum_module_details_free (GumModuleDetails * module)
+gum_thread_details_free (GumThreadDetails * details)
 {
-  if (module == NULL)
-    return;
-
-  g_free ((gpointer) module->name);
-  gum_memory_range_free ((GumMemoryRange *) module->range);
-  g_free ((gpointer) module->path);
-
-  g_slice_free (GumModuleDetails, module);
-}
-
-const gchar *
-gum_symbol_type_to_string (GumSymbolType type)
-{
-  switch (type)
-  {
-    /* Common */
-    case GUM_SYMBOL_UNKNOWN:            return "unknown";
-    case GUM_SYMBOL_SECTION:            return "section";
-
-    /* Mach-O */
-    case GUM_SYMBOL_UNDEFINED:          return "undefined";
-    case GUM_SYMBOL_ABSOLUTE:           return "absolute";
-    case GUM_SYMBOL_PREBOUND_UNDEFINED: return "prebound-undefined";
-    case GUM_SYMBOL_INDIRECT:           return "indirect";
-
-    /* ELF */
-    case GUM_SYMBOL_OBJECT:             return "object";
-    case GUM_SYMBOL_FUNCTION:           return "function";
-    case GUM_SYMBOL_FILE:               return "file";
-    case GUM_SYMBOL_COMMON:             return "common";
-    case GUM_SYMBOL_TLS:                return "tls";
-  }
-
-  g_assert_not_reached ();
-  return NULL;
+  g_free ((gpointer) details->name);
+  g_slice_free (GumThreadDetails, details);
 }

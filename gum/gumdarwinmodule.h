@@ -1,5 +1,6 @@
 /*
- * Copyright (C) 2015-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2015-2023 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2023 Fabian Freyer <fabian.freyer@physik.tu-berlin.de>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
@@ -12,8 +13,8 @@
 G_BEGIN_DECLS
 
 #define GUM_TYPE_DARWIN_MODULE (gum_darwin_module_get_type ())
-GUM_DECLARE_FINAL_TYPE (GumDarwinModule, gum_darwin_module, GUM, DARWIN_MODULE,
-                        GObject)
+G_DECLARE_FINAL_TYPE (GumDarwinModule, gum_darwin_module, GUM, DARWIN_MODULE,
+                      GObject)
 
 #define GUM_TYPE_DARWIN_MODULE_IMAGE (gum_darwin_module_image_get_type ())
 
@@ -32,6 +33,8 @@ typedef struct _GumDarwinChainedFixupsDetails GumDarwinChainedFixupsDetails;
 typedef struct _GumDarwinRebaseDetails GumDarwinRebaseDetails;
 typedef struct _GumDarwinBindDetails GumDarwinBindDetails;
 typedef struct _GumDarwinThreadedItem GumDarwinThreadedItem;
+typedef struct _GumDarwinTlvParameters GumDarwinTlvParameters;
+typedef struct _GumDarwinTlvDescriptorDetails GumDarwinTlvDescriptorDetails;
 typedef struct _GumDarwinInitPointersDetails GumDarwinInitPointersDetails;
 typedef struct _GumDarwinInitOffsetsDetails GumDarwinInitOffsetsDetails;
 typedef struct _GumDarwinTermPointersDetails GumDarwinTermPointersDetails;
@@ -63,14 +66,16 @@ typedef gboolean (* GumFoundDarwinRebaseFunc) (
     const GumDarwinRebaseDetails * details, gpointer user_data);
 typedef gboolean (* GumFoundDarwinBindFunc) (
     const GumDarwinBindDetails * details, gpointer user_data);
+
+typedef gboolean (* GumFoundDarwinTlvDescriptorFunc) (
+    const GumDarwinTlvDescriptorDetails * details, gpointer user_data);
+
 typedef gboolean (* GumFoundDarwinInitPointersFunc) (
     const GumDarwinInitPointersDetails * details, gpointer user_data);
 typedef gboolean (* GumFoundDarwinInitOffsetsFunc) (
     const GumDarwinInitOffsetsDetails * details, gpointer user_data);
 typedef gboolean (* GumFoundDarwinTermPointersFunc) (
     const GumDarwinTermPointersDetails * details, gpointer user_data);
-typedef gboolean (* GumFoundDarwinDependencyFunc) (const gchar * path,
-    gpointer user_data);
 typedef gboolean (* GumFoundDarwinFunctionStartsFunc) (
     const GumDarwinFunctionStartsDetails * details, gpointer user_data);
 
@@ -83,13 +88,30 @@ typedef enum {
   GUM_DARWIN_MODULE_FLAGS_HEADER_ONLY = (1 << 0),
 } GumDarwinModuleFlags;
 
+typedef struct _GumChainedFixupsHeader GumChainedFixupsHeader;
+typedef struct _GumChainedStartsInImage GumChainedStartsInImage;
+typedef struct _GumChainedStartsInSegment GumChainedStartsInSegment;
+
+typedef guint32 GumChainedImportFormat;
+typedef guint32 GumChainedSymbolFormat;
+typedef guint16 GumChainedPtrFormat;
+
+typedef struct _GumChainedImport GumChainedImport;
+typedef struct _GumChainedImportAddend GumChainedImportAddend;
+typedef struct _GumChainedImportAddend64 GumChainedImportAddend64;
+
+typedef struct _GumChainedPtr64Rebase GumChainedPtr64Rebase;
+typedef struct _GumChainedPtr64Bind GumChainedPtr64Bind;
+typedef struct _GumChainedPtrArm64eRebase GumChainedPtrArm64eRebase;
+typedef struct _GumChainedPtrArm64eBind GumChainedPtrArm64eBind;
+typedef struct _GumChainedPtrArm64eBind24 GumChainedPtrArm64eBind24;
+typedef struct _GumChainedPtrArm64eAuthRebase GumChainedPtrArm64eAuthRebase;
+typedef struct _GumChainedPtrArm64eAuthBind GumChainedPtrArm64eAuthBind;
+typedef struct _GumChainedPtrArm64eAuthBind24 GumChainedPtrArm64eAuthBind24;
+
 struct _GumDarwinModule
 {
-#ifndef GUM_DIET
   GObject parent;
-#else
-  GumObject parent;
-#endif
 
   GumDarwinModuleFiletype filetype;
   gchar * name;
@@ -116,6 +138,7 @@ struct _GumDarwinModule
 
   GArray * segments;
   GArray * text_ranges;
+  gsize text_size;
 
   const guint8 * rebases;
   const guint8 * rebases_end;
@@ -133,7 +156,7 @@ struct _GumDarwinModule
   const guint8 * exports_end;
   gpointer exports_malloc_data;
 
-  GPtrArray * dependencies;
+  GArray * dependencies;
   GPtrArray * reexports;
 };
 
@@ -248,6 +271,23 @@ struct _GumDarwinThreadedItem
   guint16 bind_ordinal;
 
   GumAddress rebase_address;
+};
+
+struct _GumDarwinTlvParameters
+{
+  guint num_descriptors;
+  guint descriptors_offset;
+  guint data_offset;
+  gsize data_size;
+  gsize bss_size;
+};
+
+struct _GumDarwinTlvDescriptorDetails
+{
+  guint64 file_offset;
+  GumAddress thunk;
+  guint64 key;
+  gsize offset;
 };
 
 struct _GumDarwinInitPointersDetails
@@ -372,6 +412,180 @@ enum _GumDarwinExportSymbolFlags
   GUM_DARWIN_EXPORT_STUB_AND_RESOLVER = 0x10,
 };
 
+#ifdef _MSC_VER
+# pragma warning (push)
+# pragma warning (disable: 4214)
+#endif
+
+struct _GumChainedFixupsHeader
+{
+  guint32 fixups_version;
+  guint32 starts_offset;
+  guint32 imports_offset;
+  guint32 symbols_offset;
+  guint32 imports_count;
+  GumChainedImportFormat imports_format;
+  GumChainedSymbolFormat symbols_format;
+};
+
+enum _GumChainedImportFormat
+{
+  GUM_CHAINED_IMPORT          = 1,
+  GUM_CHAINED_IMPORT_ADDEND   = 2,
+  GUM_CHAINED_IMPORT_ADDEND64 = 3,
+};
+
+struct _GumChainedImport
+{
+  guint32 lib_ordinal :  8,
+          weak_import :  1,
+          name_offset : 23;
+};
+
+struct _GumChainedImportAddend
+{
+  guint32 lib_ordinal :  8,
+          weak_import :  1,
+          name_offset : 23;
+  gint32 addend;
+};
+
+struct _GumChainedImportAddend64
+{
+  guint64 lib_ordinal : 16,
+          weak_import :  1,
+          reserved    : 15,
+          name_offset : 32;
+  guint64 addend;
+};
+
+struct _GumChainedStartsInImage
+{
+  guint32 seg_count;
+  guint32 seg_info_offset[1];
+};
+
+struct _GumChainedStartsInSegment
+{
+  guint32 size;
+  guint16 page_size;
+  GumChainedPtrFormat pointer_format;
+  guint64 segment_offset;
+  guint32 max_valid_pointer;
+  guint16 page_count;
+  guint16 page_start[1];
+};
+
+enum _GumChainedPtrStart
+{
+  GUM_CHAINED_PTR_START_NONE  = 0xffff,
+  GUM_CHAINED_PTR_START_MULTI = 0x8000,
+  GUM_CHAINED_PTR_START_LAST  = 0x8000,
+};
+
+enum _GumChainedPtrFormat
+{
+  GUM_CHAINED_PTR_ARM64E              =  1,
+  GUM_CHAINED_PTR_64                  =  2,
+  GUM_CHAINED_PTR_32                  =  3,
+  GUM_CHAINED_PTR_32_CACHE            =  4,
+  GUM_CHAINED_PTR_32_FIRMWARE         =  5,
+  GUM_CHAINED_PTR_64_OFFSET           =  6,
+  GUM_CHAINED_PTR_ARM64E_OFFSET       =  7,
+  GUM_CHAINED_PTR_ARM64E_KERNEL       =  7,
+  GUM_CHAINED_PTR_64_KERNEL_CACHE     =  8,
+  GUM_CHAINED_PTR_ARM64E_USERLAND     =  9,
+  GUM_CHAINED_PTR_ARM64E_FIRMWARE     = 10,
+  GUM_CHAINED_PTR_X86_64_KERNEL_CACHE = 11,
+  GUM_CHAINED_PTR_ARM64E_USERLAND24   = 12,
+};
+
+struct _GumChainedPtr64Rebase
+{
+  guint64 target   : 36,
+          high8    :  8,
+          reserved :  7,
+          next     : 12,
+          bind     :  1;
+};
+
+struct _GumChainedPtr64Bind
+{
+  guint64 ordinal  : 24,
+          addend   :  8,
+          reserved : 19,
+          next     : 12,
+          bind     :  1;
+};
+
+struct _GumChainedPtrArm64eRebase
+{
+  guint64 target : 43,
+          high8  :  8,
+          next   : 11,
+          bind   :  1,
+          auth   :  1;
+};
+
+struct _GumChainedPtrArm64eBind
+{
+  guint64 ordinal : 16,
+          zero    : 16,
+          addend  : 19,
+          next    : 11,
+          bind    :  1,
+          auth    :  1;
+};
+
+struct _GumChainedPtrArm64eBind24
+{
+  guint64 ordinal : 24,
+          zero    :  8,
+          addend  : 19,
+          next    : 11,
+          bind    :  1,
+          auth    :  1;
+};
+
+struct _GumChainedPtrArm64eAuthRebase
+{
+  guint64 target    : 32,
+          diversity : 16,
+          addr_div  :  1,
+          key       :  2,
+          next      : 11,
+          bind      :  1,
+          auth      :  1;
+};
+
+struct _GumChainedPtrArm64eAuthBind
+{
+  guint64 ordinal   : 16,
+          zero      : 16,
+          diversity : 16,
+          addr_div  :  1,
+          key       :  2,
+          next      : 11,
+          bind      :  1,
+          auth      :  1;
+};
+
+struct _GumChainedPtrArm64eAuthBind24
+{
+  guint64 ordinal   : 24,
+          zero      :  8,
+          diversity : 16,
+          addr_div  :  1,
+          key       :  2,
+          next      : 11,
+          bind      :  1,
+          auth      :  1;
+};
+
+#ifdef _MSC_VER
+# pragma warning (pop)
+#endif
+
 GUM_API GumDarwinModule * gum_darwin_module_new_from_file (const gchar * path,
     GumCpuType cpu_type, GumPtrauthSupport ptrauth_support,
     GumDarwinModuleFlags flags, GError ** error);
@@ -412,6 +626,11 @@ GUM_API void gum_darwin_module_enumerate_binds (GumDarwinModule * self,
     GumFoundDarwinBindFunc func, gpointer user_data);
 GUM_API void gum_darwin_module_enumerate_lazy_binds (GumDarwinModule * self,
     GumFoundDarwinBindFunc func, gpointer user_data);
+GUM_API void gum_darwin_module_query_tlv_parameters (GumDarwinModule * self,
+    GumDarwinTlvParameters * params);
+GUM_API void gum_darwin_module_enumerate_tlv_descriptors (
+    GumDarwinModule * self, GumFoundDarwinTlvDescriptorFunc func,
+    gpointer user_data);
 GUM_API void gum_darwin_module_enumerate_init_pointers (GumDarwinModule * self,
     GumFoundDarwinInitPointersFunc func, gpointer user_data);
 GUM_API void gum_darwin_module_enumerate_init_offsets (GumDarwinModule * self,
@@ -419,7 +638,7 @@ GUM_API void gum_darwin_module_enumerate_init_offsets (GumDarwinModule * self,
 GUM_API void gum_darwin_module_enumerate_term_pointers (GumDarwinModule * self,
     GumFoundDarwinTermPointersFunc func, gpointer user_data);
 GUM_API void gum_darwin_module_enumerate_dependencies (GumDarwinModule * self,
-    GumFoundDarwinDependencyFunc func, gpointer user_data);
+    GumFoundDependencyFunc func, gpointer user_data);
 GUM_API void gum_darwin_module_enumerate_function_starts (
     GumDarwinModule * self, GumFoundDarwinFunctionStartsFunc func,
     gpointer user_data);
@@ -431,9 +650,7 @@ GUM_API gboolean gum_darwin_module_ensure_image_loaded (GumDarwinModule * self,
 GUM_API void gum_darwin_threaded_item_parse (guint64 value,
     GumDarwinThreadedItem * result);
 
-#ifndef GUM_DIET
 GUM_API GType gum_darwin_module_image_get_type (void) G_GNUC_CONST;
-#endif
 GUM_API GumDarwinModuleImage * gum_darwin_module_image_new (void);
 GUM_API GumDarwinModuleImage * gum_darwin_module_image_dup (
     const GumDarwinModuleImage * other);

@@ -1,42 +1,119 @@
 /*
- * Copyright (C) 2009-2022 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2009-2024 Ole André Vadla Ravnås <oleavr@nowsecure.com>
+ * Copyright (C) 2023 Francesco Tamagni <mrmacete@protonmail.ch>
+ * Copyright (C) 2024 Håvard Sørbø <havard@hsorbo.no>
  *
  * Licence: wxWindows Library Licence, Version 3.1
  */
 
 #include "gumprocess-priv.h"
 
-#include "gumwindows.h"
+#include "gummodule-windows.h"
 
 #include <intrin.h>
 #include <psapi.h>
-#include <tchar.h>
 #include <tlhelp32.h>
 
+#ifndef _MSC_VER
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Warray-bounds"
+#endif
+
+typedef struct _GumSetHardwareBreakpointContext GumSetHardwareBreakpointContext;
+typedef struct _GumSetHardwareWatchpointContext GumSetHardwareWatchpointContext;
+typedef void (* GumModifyDebugRegistersFunc) (CONTEXT * ctx,
+    gpointer user_data);
+typedef HRESULT (WINAPI * GumGetThreadDescriptionFunc) (
+    HANDLE thread, WCHAR ** description);
 typedef void (WINAPI * GumGetCurrentThreadStackLimitsFunc) (
     PULONG_PTR low_limit, PULONG_PTR high_limit);
-typedef struct _GumFindExportContext GumFindExportContext;
+typedef BOOL (WINAPI * GumIsWow64ProcessFunc) (HANDLE process, BOOL * is_wow64);
+typedef BOOL (WINAPI * GumGetProcessInformationFunc) (HANDLE process,
+    PROCESS_INFORMATION_CLASS process_information_class,
+    void * process_information, DWORD process_information_size);
 
-struct _GumFindExportContext
+struct _GumSetHardwareBreakpointContext
 {
-  const gchar * symbol_name;
-  GumAddress result;
+  guint breakpoint_id;
+  GumAddress address;
 };
 
+struct _GumSetHardwareWatchpointContext
+{
+  guint watchpoint_id;
+  GumAddress address;
+  gsize size;
+  GumWatchConditions conditions;
+};
+
+static void gum_deinit_libc_module (void);
 static gboolean gum_windows_get_thread_details (DWORD thread_id,
     GumThreadDetails * details);
 static gboolean gum_process_enumerate_heap_ranges (HANDLE heap,
     GumFoundMallocRangeFunc func, gpointer user_data);
-static gboolean gum_store_address_if_module_has_export (
-    const GumModuleDetails * details, gpointer user_data);
-static gboolean gum_store_address_if_export_name_matches (
-    const GumExportDetails * details, gpointer user_data);
-static HMODULE get_module_handle_utf8 (const gchar * module_name);
+static void gum_do_set_hardware_breakpoint (CONTEXT * ctx, gpointer user_data);
+static void gum_do_unset_hardware_breakpoint (CONTEXT * ctx,
+    gpointer user_data);
+static void gum_do_set_hardware_watchpoint (CONTEXT * ctx, gpointer user_data);
+static void gum_do_unset_hardware_watchpoint (CONTEXT * ctx,
+    gpointer user_data);
+static gboolean gum_modify_debug_registers (GumThreadId thread_id,
+    GumModifyDebugRegistersFunc func, gpointer user_data, GError ** error);
 
-const gchar *
-gum_process_query_libc_name (void)
+static GumModule * gum_libc_module;
+
+GumModule *
+gum_process_get_libc_module (void)
 {
-  return "msvcrt.dll";
+  static gsize modules_value = 0;
+
+  if (g_once_init_enter (&modules_value))
+  {
+    gum_libc_module = gum_process_find_module_by_name ("msvcrt.dll");
+
+    _gum_register_destructor (gum_deinit_libc_module);
+
+    g_once_init_leave (&modules_value, GPOINTER_TO_SIZE (gum_libc_module) + 1);
+  }
+
+  return GSIZE_TO_POINTER (modules_value - 1);
+}
+
+static void
+gum_deinit_libc_module (void)
+{
+  g_clear_object (&gum_libc_module);
+}
+
+GumModule *
+gum_process_find_module_by_name (const gchar * name)
+{
+  gunichar2 * wide_name;
+  BOOL found;
+  HMODULE handle;
+
+  wide_name = g_utf8_to_utf16 (name, -1, NULL, NULL, NULL);
+  handle = GetModuleHandleW ((LPCWSTR) wide_name);
+  g_free (wide_name);
+  if (handle == NULL)
+    return NULL;
+
+  return GUM_MODULE (_gum_native_module_make (handle));
+}
+
+GumModule *
+gum_process_find_module_by_address (GumAddress address)
+{
+  HMODULE handle;
+
+  if (!GetModuleHandleExW (GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+        GSIZE_TO_POINTER (address), &handle))
+  {
+    return NULL;
+  }
+
+  return GUM_MODULE (_gum_native_module_make (handle));
 }
 
 gboolean
@@ -97,7 +174,8 @@ gum_process_has_thread (GumThreadId thread_id)
 gboolean
 gum_process_modify_thread (GumThreadId thread_id,
                            GumModifyThreadFunc func,
-                           gpointer user_data)
+                           gpointer user_data,
+                           GumModifyThreadFlags flags)
 {
   gboolean success = FALSE;
   HANDLE thread;
@@ -188,6 +266,10 @@ gum_windows_get_thread_details (DWORD thread_id,
                                 GumThreadDetails * details)
 {
   gboolean success = FALSE;
+  static gsize initialized = FALSE;
+  static GumGetThreadDescriptionFunc get_thread_description;
+  static DWORD desired_access;
+  HANDLE thread = NULL;
 #ifdef _MSC_VER
   __declspec (align (64))
 #endif
@@ -197,7 +279,42 @@ gum_windows_get_thread_details (DWORD thread_id,
 #endif
         = { 0, };
 
+  memset (details, 0, sizeof (GumThreadDetails));
+
+  if (g_once_init_enter (&initialized))
+  {
+    get_thread_description = (GumGetThreadDescriptionFunc) GetProcAddress (
+        GetModuleHandleW (L"kernel32.dll"),
+        "GetThreadDescription");
+
+    desired_access = THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME;
+    if (get_thread_description != NULL)
+      desired_access |= THREAD_QUERY_LIMITED_INFORMATION;
+
+    g_once_init_leave (&initialized, TRUE);
+  }
+
+  thread = OpenThread (desired_access, FALSE, thread_id);
+  if (thread == NULL)
+    goto beach;
+
   details->id = thread_id;
+
+  if (get_thread_description != NULL)
+  {
+    WCHAR * name_utf16;
+
+    if (!SUCCEEDED (get_thread_description (thread, &name_utf16)))
+      goto beach;
+
+    if (name_utf16[0] != L'\0')
+    {
+      details->name = g_utf16_to_utf8 ((const gunichar2 *) name_utf16, -1, NULL,
+          NULL, NULL);
+    }
+
+    LocalFree (name_utf16);
+  }
 
   if (thread_id == GetCurrentThreadId ())
   {
@@ -210,102 +327,46 @@ gum_windows_get_thread_details (DWORD thread_id,
   }
   else
   {
-    HANDLE thread;
+    DWORD previous_suspend_count;
 
-    thread = OpenThread (THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME, FALSE,
-        thread_id);
-    if (thread != NULL)
+    previous_suspend_count = SuspendThread (thread);
+    if (previous_suspend_count == (DWORD) -1)
+      goto beach;
+
+    if (previous_suspend_count == 0)
+      details->state = GUM_THREAD_RUNNING;
+    else
+      details->state = GUM_THREAD_STOPPED;
+
+    context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    if (GetThreadContext (thread, &context))
     {
-      DWORD previous_suspend_count;
-
-      previous_suspend_count = SuspendThread (thread);
-      if (previous_suspend_count != (DWORD) -1)
-      {
-        if (previous_suspend_count == 0)
-          details->state = GUM_THREAD_RUNNING;
-        else
-          details->state = GUM_THREAD_STOPPED;
-
-        context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-        if (GetThreadContext (thread, &context))
-        {
-          gum_windows_parse_context (&context, &details->cpu_context);
-          success = TRUE;
-        }
-
-        ResumeThread (thread);
-      }
-
-      CloseHandle (thread);
+      gum_windows_parse_context (&context, &details->cpu_context);
+      success = TRUE;
     }
+
+    ResumeThread (thread);
   }
+
+beach:
+  if (thread != NULL)
+    CloseHandle (thread);
+
+  if (!success)
+    g_free ((gpointer) details->name);
 
   return success;
 }
 
-void
-gum_process_enumerate_modules (GumFoundModuleFunc func,
-                               gpointer user_data)
+gboolean
+_gum_process_collect_main_module (GumModule * module,
+                                  gpointer user_data)
 {
-  HANDLE this_process;
-  HMODULE first_module;
-  DWORD modules_size = 0;
-  HMODULE * modules = NULL;
-  guint mod_idx;
+  GumModule ** out = user_data;
 
-  this_process = GetCurrentProcess ();
+  *out = g_object_ref (module);
 
-  if (!EnumProcessModules (this_process, &first_module, sizeof (first_module),
-      &modules_size))
-  {
-    goto beach;
-  }
-
-  modules = (HMODULE *) g_malloc (modules_size);
-
-  if (!EnumProcessModules (this_process, modules, modules_size, &modules_size))
-  {
-    goto beach;
-  }
-
-  for (mod_idx = 0; mod_idx != modules_size / sizeof (HMODULE); mod_idx++)
-  {
-    MODULEINFO mi;
-    WCHAR module_path_utf16[MAX_PATH];
-    gchar * module_path, * module_name;
-    GumMemoryRange range;
-    GumModuleDetails details;
-    gboolean carry_on;
-
-    if (!GetModuleInformation (this_process, modules[mod_idx], &mi,
-        sizeof (mi)))
-    {
-      continue;
-    }
-
-    GetModuleFileNameW (modules[mod_idx], module_path_utf16, MAX_PATH);
-    module_path_utf16[MAX_PATH - 1] = '\0';
-    module_path = g_utf16_to_utf8 ((const gunichar2 *) module_path_utf16, -1,
-        NULL, NULL, NULL);
-    module_name = strrchr (module_path, '\\') + 1;
-
-    range.base_address = GUM_ADDRESS (mi.lpBaseOfDll);
-    range.size = mi.SizeOfImage;
-
-    details.name = module_name;
-    details.range = &range;
-    details.path = module_path;
-
-    carry_on = func (&details, user_data);
-
-    g_free (module_path);
-
-    if (!carry_on)
-      break;
-  }
-
-beach:
-  g_free (modules);
+  return FALSE;
 }
 
 void
@@ -433,7 +494,7 @@ gum_thread_try_get_ranges (GumMemoryRange * ranges,
   if (g_once_init_enter (&initialized))
   {
     get_stack_limits = (GumGetCurrentThreadStackLimitsFunc) GetProcAddress (
-        GetModuleHandle (_T ("kernel32.dll")),
+        GetModuleHandleW (L"kernel32.dll"),
         "GetCurrentThreadStackLimits");
 
     g_once_init_leave (&initialized, TRUE);
@@ -570,294 +631,330 @@ beach:
 }
 
 gboolean
-gum_module_load (const gchar * module_name,
-                 GError ** error)
+gum_thread_set_hardware_breakpoint (GumThreadId thread_id,
+                                    guint breakpoint_id,
+                                    GumAddress address,
+                                    GError ** error)
 {
-  gunichar2 * wide_name;
-  HMODULE module;
+  GumSetHardwareBreakpointContext bpc;
 
-  wide_name = g_utf8_to_utf16 (module_name, -1, NULL, NULL, NULL);
-  module = LoadLibraryW ((LPCWSTR) wide_name);
-  g_free (wide_name);
+  bpc.breakpoint_id = breakpoint_id;
+  bpc.address = address;
 
-  if (module == NULL)
-    goto not_found;
+  return gum_modify_debug_registers (thread_id, gum_do_set_hardware_breakpoint,
+      &bpc, error);
+}
 
-  return TRUE;
+static void
+gum_do_set_hardware_breakpoint (CONTEXT * ctx,
+                                gpointer user_data)
+{
+  GumSetHardwareBreakpointContext * bpc = user_data;
 
-not_found:
-  {
-    g_set_error (error, GUM_ERROR, GUM_ERROR_NOT_FOUND,
-        "LoadLibrary failed: 0x%08lx", GetLastError ());
-    return FALSE;
-  }
+#ifdef HAVE_ARM64
+  _gum_arm64_set_breakpoint (ctx->Bcr, ctx->Bvr, bpc->breakpoint_id,
+      bpc->address);
+#else
+  _gum_x86_set_breakpoint (&ctx->Dr7, &ctx->Dr0, bpc->breakpoint_id,
+      bpc->address);
+#endif
 }
 
 gboolean
-gum_module_ensure_initialized (const gchar * module_name)
+gum_thread_unset_hardware_breakpoint (GumThreadId thread_id,
+                                      guint breakpoint_id,
+                                      GError ** error)
 {
-  HMODULE module;
-
-  module = get_module_handle_utf8 (module_name);
-
-  return module != NULL;
+  return gum_modify_debug_registers (thread_id,
+      gum_do_unset_hardware_breakpoint, GUINT_TO_POINTER (breakpoint_id),
+      error);
 }
 
-void
-gum_module_enumerate_imports (const gchar * module_name,
-                              GumFoundImportFunc func,
-                              gpointer user_data)
+static void
+gum_do_unset_hardware_breakpoint (CONTEXT * ctx,
+                                  gpointer user_data)
 {
-  gpointer module;
-  const guint8 * mod_base;
-  const IMAGE_DOS_HEADER * dos_hdr;
-  const IMAGE_NT_HEADERS * nt_hdrs;
-  const IMAGE_DATA_DIRECTORY * entry;
-  const IMAGE_IMPORT_DESCRIPTOR * desc;
+  guint breakpoint_id = GPOINTER_TO_UINT (user_data);
 
-  module = get_module_handle_utf8 (module_name);
-  if (module == NULL)
-    return;
+#ifdef HAVE_ARM64
+  _gum_arm64_unset_breakpoint (ctx->Bcr, ctx->Bvr, breakpoint_id);
+#else
+  _gum_x86_unset_breakpoint (&ctx->Dr7, &ctx->Dr0, breakpoint_id);
+#endif
+}
 
-  mod_base = (const guint8 *) module;
-  dos_hdr = (const IMAGE_DOS_HEADER *) module;
-  nt_hdrs = (const IMAGE_NT_HEADERS *) &mod_base[dos_hdr->e_lfanew];
-  entry = &nt_hdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-  desc = (const IMAGE_IMPORT_DESCRIPTOR *) (mod_base + entry->VirtualAddress);
+gboolean
+gum_thread_set_hardware_watchpoint (GumThreadId thread_id,
+                                    guint watchpoint_id,
+                                    GumAddress address,
+                                    gsize size,
+                                    GumWatchConditions wc,
+                                    GError ** error)
+{
+  GumSetHardwareWatchpointContext wpc;
 
-  for (; desc->Characteristics != 0; desc++)
+  wpc.watchpoint_id = watchpoint_id;
+  wpc.address = address;
+  wpc.size = size;
+  wpc.conditions = wc;
+
+  return gum_modify_debug_registers (thread_id, gum_do_set_hardware_watchpoint,
+      &wpc, error);
+}
+
+static void
+gum_do_set_hardware_watchpoint (CONTEXT * ctx,
+                                gpointer user_data)
+{
+  GumSetHardwareWatchpointContext * wpc = user_data;
+
+#ifdef HAVE_ARM64
+  _gum_arm64_set_watchpoint (ctx->Wcr, ctx->Wvr, wpc->watchpoint_id,
+      wpc->address, wpc->size, wpc->conditions);
+#else
+  _gum_x86_set_watchpoint (&ctx->Dr7, &ctx->Dr0, wpc->watchpoint_id,
+      wpc->address, wpc->size, wpc->conditions);
+#endif
+}
+
+gboolean
+gum_thread_unset_hardware_watchpoint (GumThreadId thread_id,
+                                      guint watchpoint_id,
+                                      GError ** error)
+{
+  return gum_modify_debug_registers (thread_id,
+      gum_do_unset_hardware_watchpoint, GUINT_TO_POINTER (watchpoint_id),
+      error);
+}
+
+static void
+gum_do_unset_hardware_watchpoint (CONTEXT * ctx,
+                                  gpointer user_data)
+{
+  guint watchpoint_id = GPOINTER_TO_UINT (user_data);
+
+#ifdef HAVE_ARM64
+  _gum_arm64_unset_watchpoint (ctx->Wcr, ctx->Wvr, watchpoint_id);
+#else
+  _gum_x86_unset_watchpoint (&ctx->Dr7, &ctx->Dr0, watchpoint_id);
+#endif
+}
+
+static gboolean
+gum_modify_debug_registers (GumThreadId thread_id,
+                            GumModifyDebugRegistersFunc func,
+                            gpointer user_data,
+                            GError ** error)
+{
+  gboolean success = FALSE;
+  HANDLE thread = NULL;
+  CONTEXT * active_ctx;
+
+  if (thread_id == gum_process_get_current_thread_id () &&
+      (active_ctx = gum_windows_get_active_exceptor_context ()) != NULL)
   {
-    GumImportDetails details;
-    const IMAGE_THUNK_DATA * thunk_data;
-
-    if (desc->OriginalFirstThunk == 0)
-      continue;
-
-    details.type = GUM_IMPORT_FUNCTION; /* FIXME: how can we tell? */
-    details.name = NULL;
-    details.module = (const gchar *) (mod_base + desc->Name);
-    details.address = 0;
-    details.slot = 0; /* TODO */
-
-    thunk_data = (const IMAGE_THUNK_DATA *)
-        (mod_base + desc->OriginalFirstThunk);
-    for (; thunk_data->u1.AddressOfData != 0; thunk_data++)
-    {
-      if ((thunk_data->u1.AddressOfData & IMAGE_ORDINAL_FLAG) != 0)
-        continue; /* FIXME: we ignore imports by ordinal */
-
-      details.name = (const gchar *)
-          (mod_base + thunk_data->u1.AddressOfData + 2);
-      details.address =
-          gum_module_find_export_by_name (details.module, details.name);
-
-      if (!func (&details, user_data))
-        return;
-    }
-  }
-}
-
-void
-gum_module_enumerate_exports (const gchar * module_name,
-                              GumFoundExportFunc func,
-                              gpointer user_data)
-{
-  gpointer module;
-  const guint8 * mod_base;
-  const IMAGE_DOS_HEADER * dos_hdr;
-  const IMAGE_NT_HEADERS * nt_hdrs;
-  const IMAGE_DATA_DIRECTORY * entry;
-  const IMAGE_EXPORT_DIRECTORY * exp;
-  const guint8 * exp_start, * exp_end;
-
-  module = get_module_handle_utf8 (module_name);
-  if (module == NULL)
-    return;
-
-  mod_base = (const guint8 *) module;
-  dos_hdr = (const IMAGE_DOS_HEADER *) module;
-  nt_hdrs = (const IMAGE_NT_HEADERS *) &mod_base[dos_hdr->e_lfanew];
-  entry = &nt_hdrs->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
-  exp = (const IMAGE_EXPORT_DIRECTORY *)(mod_base + entry->VirtualAddress);
-  exp_start = mod_base + entry->VirtualAddress;
-  exp_end = exp_start + entry->Size - 1;
-
-  if (exp->AddressOfNames != 0)
-  {
-    const DWORD * name_rvas, * func_rvas;
-    const WORD * ord_rvas;
-    DWORD index;
-
-    name_rvas = (const DWORD *) &mod_base[exp->AddressOfNames];
-    ord_rvas = (const WORD *) &mod_base[exp->AddressOfNameOrdinals];
-    func_rvas = (const DWORD *) &mod_base[exp->AddressOfFunctions];
-
-    for (index = 0; index < exp->NumberOfNames; index++)
-    {
-      DWORD func_rva;
-      const guint8 * func_address;
-
-      func_rva = func_rvas[ord_rvas[index]];
-      func_address = &mod_base[func_rva];
-      if (func_address < exp_start || func_address > exp_end)
-      {
-        GumExportDetails details;
-
-        details.type = GUM_EXPORT_FUNCTION; /* TODO: data exports */
-        details.name = (const gchar *) &mod_base[name_rvas[index]];
-        details.address = GUM_ADDRESS (func_address);
-
-        if (!func (&details, user_data))
-          return;
-      }
-    }
-  }
-}
-
-void
-gum_module_enumerate_symbols (const gchar * module_name,
-                              GumFoundSymbolFunc func,
-                              gpointer user_data)
-{
-  /* TODO: implement */
-}
-
-void
-gum_module_enumerate_ranges (const gchar * module_name,
-                             GumPageProtection prot,
-                             GumFoundRangeFunc func,
-                             gpointer user_data)
-{
-  HANDLE this_process = GetCurrentProcess ();
-  HMODULE module;
-  MODULEINFO mi;
-  guint8 * cur_base_address, * end_address;
-
-  module = get_module_handle_utf8 (module_name);
-  if (module == NULL)
-    return;
-
-  if (!GetModuleInformation (this_process, module, &mi, sizeof (mi)))
-    return;
-
-  cur_base_address = (guint8 *) mi.lpBaseOfDll;
-  end_address = (guint8 *) mi.lpBaseOfDll + mi.SizeOfImage;
-
-  do
-  {
-    MEMORY_BASIC_INFORMATION mbi;
-    SIZE_T ret G_GNUC_UNUSED;
-
-    ret = VirtualQuery (cur_base_address, &mbi, sizeof (mbi));
-    g_assert (ret != 0);
-
-    if (mbi.Protect != 0)
-    {
-      GumPageProtection cur_prot;
-
-      cur_prot = gum_page_protection_from_windows (mbi.Protect);
-
-      if ((cur_prot & prot) == prot)
-      {
-        GumMemoryRange range;
-        GumRangeDetails details;
-
-        range.base_address = GUM_ADDRESS (cur_base_address);
-        range.size = mbi.RegionSize;
-
-        details.range = &range;
-        details.protection = cur_prot;
-        details.file = NULL; /* TODO */
-
-        if (!func (&details, user_data))
-          return;
-      }
-    }
-
-    cur_base_address += mbi.RegionSize;
-  }
-  while (cur_base_address < end_address);
-}
-
-GumAddress
-gum_module_find_base_address (const gchar * module_name)
-{
-  return GUM_ADDRESS (get_module_handle_utf8 (module_name));
-}
-
-GumAddress
-gum_module_find_export_by_name (const gchar * module_name,
-                                const gchar * symbol_name)
-{
-  if (module_name == NULL)
-  {
-    GumFindExportContext ctx;
-
-    ctx.symbol_name = symbol_name;
-    ctx.result = 0;
-
-    gum_process_enumerate_modules (gum_store_address_if_module_has_export,
-        &ctx);
-
-    return ctx.result;
+    func (active_ctx, user_data);
   }
   else
   {
-    HMODULE module;
+    CONTEXT ctx = { 0, };
 
-    module = get_module_handle_utf8 (module_name);
-    if (module == NULL)
-      return 0;
+    thread = OpenThread (
+        THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT,
+        FALSE,
+        thread_id);
+    if (thread == NULL)
+      goto failure;
 
-    return GUM_ADDRESS (GetProcAddress (module, symbol_name));
+    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+
+    if (!GetThreadContext (thread, &ctx))
+      goto failure;
+
+    func (&ctx, user_data);
+
+    if (!SetThreadContext (thread, &ctx))
+      goto failure;
   }
-}
 
-static gboolean
-gum_store_address_if_module_has_export (const GumModuleDetails * details,
-                                        gpointer user_data)
-{
-  GumFindExportContext * ctx = user_data;
+  success = TRUE;
+  goto beach;
 
-  gum_module_enumerate_exports (details->path,
-      gum_store_address_if_export_name_matches, ctx);
-
-  return ctx->result == 0;
-}
-
-static gboolean
-gum_store_address_if_export_name_matches (const GumExportDetails * details,
-                                          gpointer user_data)
-{
-  GumFindExportContext * ctx = user_data;
-
-  if (strcmp (details->name, ctx->symbol_name) == 0)
+failure:
   {
-    ctx->result = details->address;
-    return FALSE;
+    g_set_error (error,
+        GUM_ERROR,
+        GUM_ERROR_FAILED,
+        "Unable to modify debug registers: 0x%08lx", GetLastError ());
+    goto beach;
   }
+beach:
+  {
+    if (thread != NULL)
+      CloseHandle (thread);
 
-  return TRUE;
+    return success;
+  }
 }
 
-static HMODULE
-get_module_handle_utf8 (const gchar * module_name)
+GumCpuType
+gum_windows_query_native_cpu_type (void)
 {
-  HMODULE module;
-  gunichar2 * wide_name;
+  static gsize initialized = FALSE;
+  static GumCpuType type;
 
-  wide_name = g_utf8_to_utf16 (module_name, -1, NULL, NULL, NULL);
-  module = GetModuleHandleW ((LPCWSTR) wide_name);
-  g_free (wide_name);
+  if (g_once_init_enter (&initialized))
+  {
+    SYSTEM_INFO si;
 
-  return module;
+    GetNativeSystemInfo (&si);
+
+    switch (si.wProcessorArchitecture)
+    {
+      case PROCESSOR_ARCHITECTURE_INTEL:
+        type = GUM_CPU_IA32;
+        break;
+      case PROCESSOR_ARCHITECTURE_AMD64:
+        type = GUM_CPU_AMD64;
+        break;
+      case PROCESSOR_ARCHITECTURE_ARM64:
+        type = GUM_CPU_ARM64;
+        break;
+      default:
+        g_assert_not_reached ();
+    }
+
+    g_once_init_leave (&initialized, TRUE);
+  }
+
+  return type;
+}
+
+GumCpuType
+gum_windows_cpu_type_from_pid (guint pid,
+                               GError ** error)
+{
+  GumCpuType result = -1;
+  HANDLE process;
+  static gsize initialized = FALSE;
+  static GumIsWow64ProcessFunc is_wow64_process;
+  static GumGetProcessInformationFunc get_process_information;
+
+  process = OpenProcess (PROCESS_QUERY_INFORMATION, FALSE, pid);
+  if (process == NULL)
+    goto propagate_api_error;
+
+  if (g_once_init_enter (&initialized))
+  {
+    HMODULE kernel32;
+
+    kernel32 = GetModuleHandleW (L"kernel32.dll");
+
+    is_wow64_process = (GumIsWow64ProcessFunc)
+        GetProcAddress (kernel32, "IsWow64Process");
+    get_process_information = (GumGetProcessInformationFunc)
+        GetProcAddress (kernel32, "GetProcessInformation");
+
+    if (get_process_information != NULL)
+    {
+      NTSTATUS (WINAPI * rtl_get_version) (PRTL_OSVERSIONINFOW info);
+      RTL_OSVERSIONINFOW info = { 0, };
+      gboolean win11_or_newer;
+
+      rtl_get_version = (NTSTATUS (WINAPI *) (PRTL_OSVERSIONINFOW))
+          GetProcAddress (GetModuleHandleW (L"ntdll.dll"), "RtlGetVersion");
+
+      info.dwOSVersionInfoSize = sizeof (info);
+      rtl_get_version (&info);
+
+      win11_or_newer =
+          info.dwMajorVersion >= 11 ||
+          (info.dwMajorVersion == 10 &&
+           (info.dwMinorVersion > 0 || info.dwBuildNumber >= 22000));
+      if (!win11_or_newer)
+        get_process_information = NULL;
+    }
+
+    g_once_init_leave (&initialized, TRUE);
+  }
+
+  if (get_process_information != NULL)
+  {
+    PROCESS_MACHINE_INFORMATION info;
+
+    if (!get_process_information (process, ProcessMachineTypeInfo, &info,
+          sizeof (info)))
+    {
+      goto propagate_api_error;
+    }
+
+    switch (info.ProcessMachine)
+    {
+      case IMAGE_FILE_MACHINE_I386:
+        result = GUM_CPU_IA32;
+        break;
+      case IMAGE_FILE_MACHINE_AMD64:
+        result = GUM_CPU_AMD64;
+        break;
+      case IMAGE_FILE_MACHINE_ARM64:
+        result = GUM_CPU_ARM64;
+        break;
+      default:
+        g_assert_not_reached ();
+    }
+  }
+  else if (is_wow64_process != NULL)
+  {
+    BOOL is_wow64;
+
+    if (!is_wow64_process (process, &is_wow64))
+      goto propagate_api_error;
+
+    result = is_wow64 ? GUM_CPU_IA32 : gum_windows_query_native_cpu_type ();
+  }
+  else
+  {
+    result = gum_windows_query_native_cpu_type ();
+  }
+
+  goto beach;
+
+propagate_api_error:
+  {
+    DWORD code = GetLastError ();
+
+    switch (code)
+    {
+      case ERROR_INVALID_PARAMETER:
+        g_set_error (error, GUM_ERROR, GUM_ERROR_NOT_FOUND,
+            "Process not found");
+        break;
+      case ERROR_ACCESS_DENIED:
+        g_set_error (error, GUM_ERROR, GUM_ERROR_PERMISSION_DENIED,
+            "Permission denied");
+        break;
+      default:
+        g_set_error (error, GUM_ERROR, GUM_ERROR_FAILED,
+            "Unexpectedly failed with error code: 0x%08x", code);
+        break;
+    }
+
+    goto beach;
+  }
+beach:
+  {
+    if (process != NULL)
+      CloseHandle (process);
+
+    return result;
+  }
 }
 
 void
 gum_windows_parse_context (const CONTEXT * context,
                            GumCpuContext * cpu_context)
 {
-#if GLIB_SIZEOF_VOID_P == 4
+#if defined (HAVE_I386) && GLIB_SIZEOF_VOID_P == 4
   cpu_context->eip = context->Eip;
 
   cpu_context->edi = context->Edi;
@@ -868,7 +965,7 @@ gum_windows_parse_context (const CONTEXT * context,
   cpu_context->edx = context->Edx;
   cpu_context->ecx = context->Ecx;
   cpu_context->eax = context->Eax;
-#else
+#elif defined (HAVE_I386) && GLIB_SIZEOF_VOID_P == 8
   cpu_context->rip = context->Rip;
 
   cpu_context->r15 = context->R15;
@@ -888,6 +985,47 @@ gum_windows_parse_context (const CONTEXT * context,
   cpu_context->rdx = context->Rdx;
   cpu_context->rcx = context->Rcx;
   cpu_context->rax = context->Rax;
+#else
+  guint i;
+
+  cpu_context->pc = context->Pc;
+  cpu_context->sp = context->Sp;
+  cpu_context->nzcv = context->Cpsr;
+
+  cpu_context->x[0] = context->X0;
+  cpu_context->x[1] = context->X1;
+  cpu_context->x[2] = context->X2;
+  cpu_context->x[3] = context->X3;
+  cpu_context->x[4] = context->X4;
+  cpu_context->x[5] = context->X5;
+  cpu_context->x[6] = context->X6;
+  cpu_context->x[7] = context->X7;
+  cpu_context->x[8] = context->X8;
+  cpu_context->x[9] = context->X9;
+  cpu_context->x[10] = context->X10;
+  cpu_context->x[11] = context->X11;
+  cpu_context->x[12] = context->X12;
+  cpu_context->x[13] = context->X13;
+  cpu_context->x[14] = context->X14;
+  cpu_context->x[15] = context->X15;
+  cpu_context->x[16] = context->X16;
+  cpu_context->x[17] = context->X17;
+  cpu_context->x[18] = context->X18;
+  cpu_context->x[19] = context->X19;
+  cpu_context->x[20] = context->X20;
+  cpu_context->x[21] = context->X21;
+  cpu_context->x[22] = context->X22;
+  cpu_context->x[23] = context->X23;
+  cpu_context->x[24] = context->X24;
+  cpu_context->x[25] = context->X25;
+  cpu_context->x[26] = context->X26;
+  cpu_context->x[27] = context->X27;
+  cpu_context->x[28] = context->X28;
+  cpu_context->fp = context->Fp;
+  cpu_context->lr = context->Lr;
+
+  for (i = 0; i != G_N_ELEMENTS (cpu_context->v); i++)
+    memcpy (cpu_context->v[i].q, context->V[i].B, 16);
 #endif
 }
 
@@ -895,7 +1033,7 @@ void
 gum_windows_unparse_context (const GumCpuContext * cpu_context,
                              CONTEXT * context)
 {
-#if GLIB_SIZEOF_VOID_P == 4
+#if defined (HAVE_I386) && GLIB_SIZEOF_VOID_P == 4
   context->Eip = cpu_context->eip;
 
   context->Edi = cpu_context->edi;
@@ -906,7 +1044,7 @@ gum_windows_unparse_context (const GumCpuContext * cpu_context,
   context->Edx = cpu_context->edx;
   context->Ecx = cpu_context->ecx;
   context->Eax = cpu_context->eax;
-#else
+#elif defined (HAVE_I386) && GLIB_SIZEOF_VOID_P == 8
   context->Rip = cpu_context->rip;
 
   context->R15 = cpu_context->r15;
@@ -926,5 +1064,50 @@ gum_windows_unparse_context (const GumCpuContext * cpu_context,
   context->Rdx = cpu_context->rdx;
   context->Rcx = cpu_context->rcx;
   context->Rax = cpu_context->rax;
+#else
+  guint i;
+
+  context->Pc = cpu_context->pc;
+  context->Sp = cpu_context->sp;
+  context->Cpsr = cpu_context->nzcv;
+
+  context->X0 = cpu_context->x[0];
+  context->X1 = cpu_context->x[1];
+  context->X2 = cpu_context->x[2];
+  context->X3 = cpu_context->x[3];
+  context->X4 = cpu_context->x[4];
+  context->X5 = cpu_context->x[5];
+  context->X6 = cpu_context->x[6];
+  context->X7 = cpu_context->x[7];
+  context->X8 = cpu_context->x[8];
+  context->X9 = cpu_context->x[9];
+  context->X10 = cpu_context->x[10];
+  context->X11 = cpu_context->x[11];
+  context->X12 = cpu_context->x[12];
+  context->X13 = cpu_context->x[13];
+  context->X14 = cpu_context->x[14];
+  context->X15 = cpu_context->x[15];
+  context->X16 = cpu_context->x[16];
+  context->X17 = cpu_context->x[17];
+  context->X18 = cpu_context->x[18];
+  context->X19 = cpu_context->x[19];
+  context->X20 = cpu_context->x[20];
+  context->X21 = cpu_context->x[21];
+  context->X22 = cpu_context->x[22];
+  context->X23 = cpu_context->x[23];
+  context->X24 = cpu_context->x[24];
+  context->X25 = cpu_context->x[25];
+  context->X26 = cpu_context->x[26];
+  context->X27 = cpu_context->x[27];
+  context->X28 = cpu_context->x[28];
+  context->Fp = cpu_context->fp;
+  context->Lr = cpu_context->lr;
+
+  for (i = 0; i != G_N_ELEMENTS (cpu_context->v); i++)
+    memcpy (context->V[i].B, cpu_context->v[i].q, 16);
 #endif
 }
+
+#ifndef _MSC_VER
+# pragma GCC diagnostic pop
+#endif
