@@ -120,9 +120,9 @@ gum_hook_loader (GumModuleRegistry * registry)
 
   gum_interceptor_begin_transaction (gum_ldr_interceptor);
   gum_interceptor_attach (gum_ldr_interceptor, load_impl, gum_load_handler,
-      NULL);
+      NULL, GUM_ATTACH_FLAGS_UNIGNORABLE);
   gum_interceptor_attach (gum_ldr_interceptor, unload_impl, gum_unload_handler,
-      NULL);
+      NULL, GUM_ATTACH_FLAGS_UNIGNORABLE);
   gum_interceptor_end_transaction (gum_ldr_interceptor);
 }
 
@@ -213,7 +213,15 @@ gum_module_registry_unload_dll_on_leave (GumInvocationContext * ic,
         (LPCWSTR) invocation->module_handle,
         &handle))
   {
-    _gum_module_registry_unregister (self,
-        GUM_ADDRESS (invocation->module_handle));
+    gum_module_registry_lock (self);
+
+    if (g_hash_table_contains (gum_current_modules, invocation->module_handle))
+    {
+      g_hash_table_remove (gum_current_modules, invocation->module_handle);
+      _gum_module_registry_unregister (self,
+          GUM_ADDRESS (invocation->module_handle));
+    }
+
+    gum_module_registry_unlock (self);
   }
 }

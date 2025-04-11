@@ -72,6 +72,17 @@ namespace Gum {
 		ABORT_SAFELY,
 	}
 
+	public enum ThreadFlags {
+		NAME,
+		STATE,
+		CPU_CONTEXT,
+		ENTRYPOINT_ROUTINE,
+		ENTRYPOINT_PARAMETER,
+
+		NONE,
+		ALL,
+	}
+
 	public enum OS {
 		WINDOWS,
 		MACOS,
@@ -138,7 +149,8 @@ namespace Gum {
 	public class Interceptor : GLib.Object {
 		public static Interceptor obtain ();
 
-		public Gum.AttachReturn attach (void * function_address, Gum.InvocationListener listener, void * listener_function_data = null);
+		public Gum.AttachReturn attach (void * function_address, Gum.InvocationListener listener,
+			void * listener_function_data = null, Gum.AttachFlags flags = NONE);
 		public void detach (Gum.InvocationListener listener);
 
 		public Gum.ReplaceReturn replace (void * function_address, void * replacement_function, void * replacement_data = null,
@@ -296,7 +308,7 @@ namespace Gum {
 		public Gum.ThreadId get_current_thread_id ();
 		public bool has_thread (Gum.ThreadId thread_id);
 		public bool modify_thread (Gum.ThreadId thread_id, Gum.ModifyThreadFunc func, Gum.ModifyThreadFlags flags = NONE);
-		public void enumerate_threads (Gum.FoundThreadFunc func);
+		public void enumerate_threads (Gum.FoundThreadFunc func, Gum.ThreadFlags flags = ALL);
 		public unowned Module get_main_module ();
 		public unowned Module? get_libc_module ();
 		public Module? find_module_by_name (string name);
@@ -561,10 +573,17 @@ namespace Gum {
 		HALTED
 	}
 
+	public struct ThreadEntrypoint {
+		Gum.Address routine;
+		Gum.Address parameter;
+	}
+
 	public struct ThreadDetails {
+		public Gum.ThreadFlags flags;
 		public Gum.ThreadId id;
 		public Gum.ThreadState state;
-		public CpuContext cpu_context;
+		public Gum.CpuContext cpu_context;
+		public Gum.ThreadEntrypoint entrypoint;
 	}
 
 	[CCode (cprefix = "GUM_IMPORT_")]
@@ -707,6 +726,12 @@ namespace Gum {
 		public unowned string symbol_name;
 		public unowned string file_name;
 		public uint line_number;
+	}
+
+	[Flags]
+	public enum AttachFlags {
+		NONE,
+		UNIGNORABLE,
 	}
 
 	[CCode (cprefix = "GUM_ATTACH_")]

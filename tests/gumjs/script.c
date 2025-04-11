@@ -6946,8 +6946,10 @@ simulate_crash_handler (gpointer user_data)
   GumCrashExceptorContext * ctx = user_data;
   GumScriptBackend * backend = ctx->backend;
 
-  gum_process_enumerate_threads (suspend_all_threads, backend);
-  gum_process_enumerate_threads (resume_all_threads, backend);
+  gum_process_enumerate_threads (suspend_all_threads, backend,
+      GUM_THREAD_FLAGS_NONE);
+  gum_process_enumerate_threads (resume_all_threads, backend,
+      GUM_THREAD_FLAGS_NONE);
 
   return NULL;
 }
@@ -7837,7 +7839,8 @@ interceptor_attacher_worker (gpointer data)
   for (i = 0; i != 300; i++)
   {
     result = gum_interceptor_attach (interceptor, target_function_int,
-        GUM_INVOCATION_LISTENER (listener), NULL);
+        GUM_INVOCATION_LISTENER (listener), NULL,
+        GUM_ATTACH_FLAGS_NONE);
     if (result == GUM_ATTACH_OK)
     {
       g_usleep (G_USEC_PER_SEC / 25);
