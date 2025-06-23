@@ -16,6 +16,10 @@ gumjs_sources = [
   'gumcmodule.c',
 ]
 
+if host_os_family == 'windows'
+  gumjs_sources += 'gumansi.c'
+endif
+
 if sqlite_dep.found()
   gumjs_sources += 'gummemoryvfs.c'
 endif
@@ -24,7 +28,6 @@ if quickjs_dep.found()
   gumjs_sources += [
     'gumquickscriptbackend.c',
     'gumquickscript.c',
-    'gumquickbundle.c',
     'gumquickvalue.c',
     'gumquickobject.c',
     'gumquickcore.c',
@@ -55,7 +58,7 @@ if quickjs_dep.found()
   endif
 
   quickcompile = executable('quickcompile', 'gumquickcompile.c',
-    dependencies: [quickjs_dep_native],
+    dependencies: [quickjs_dep_native, gio_dep_native],
     native: true,
   )
 else
@@ -67,7 +70,6 @@ if v8_dep.found()
     'gumv8scriptbackend.cpp',
     'gumv8script.cpp',
     'gumv8platform.cpp',
-    'gumv8bundle.cpp',
     'gumv8scope.cpp',
     'gumv8value.cpp',
     'gumv8object.cpp',
@@ -165,9 +167,6 @@ gumjs_runtime_sources = [
   'runtime' / 'console.js',
   'runtime' / 'hexdump.js',
   'runtime' / 'worker.js',
-  'runtime' / 'objc.js',
-  'runtime' / 'swift.js',
-  'runtime' / 'java.js',
   'runtime' / 'cmodule-tcc' / 'inttypes.h',
   'runtime' / 'cmodule-tcc' / 'stdint.h',
   'runtime' / 'cmodule-tcc' / 'stdio.h',
@@ -192,18 +191,10 @@ gumjs_runtime_outputs = [
   'gumcmodule-runtime.h',
 ]
 if quickjs_dep.found()
-  gumjs_runtime_outputs += [
-    'gumquickscript-runtime.h',
-    'gumquickscript-objc.h',
-    'gumquickscript-java.h',
-  ]
+  gumjs_runtime_outputs += 'gumquickscript-runtime.h'
 endif
 if v8_dep.found()
-  gumjs_runtime_outputs += [
-    'gumv8script-runtime.h',
-    'gumv8script-objc.h',
-    'gumv8script-java.h',
-  ]
+  gumjs_runtime_outputs += 'gumv8script-runtime.h'
 endif
 
 install_headers(gumjs_headers, subdir: install_header_basedir / 'gumjs')
@@ -250,11 +241,11 @@ gumjs_runtime = custom_target('gumjs-runtime',
     meson.project_source_root() / 'gum',
     capstone_dep.get_variable('includedir') / 'capstone',
     libtcc_incdir,
-    npm,
     quickcompile,
     ','.join(backends),
     host_arch,
     host_machine.endian(),
+    '@INPUT@',
   ],
 )
 gumjs_sources += [gumjs_runtime]

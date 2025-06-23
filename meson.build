@@ -17,7 +17,7 @@ endif
 
 frida_version = get_option('frida_version')
 if frida_version == ''
-  frida_version = run_command(python, files(releng / 'frida_version.py'), meson.project_source_root(), check: true).stdout().strip()
+  frida_version = run_command(python, releng / 'frida_version.py', meson.project_source_root(), check: true).stdout().strip()
 endif
 
 api_version = '1.0'
@@ -375,6 +375,8 @@ else
   gio_os_package_dep = disabler()
 endif
 
+gio_dep_native = dependency('gio-2.0', native: true)
+
 capstone_arch_mappings = {
   'x86_64': 'x86',
   's390x': 'sysz',
@@ -606,7 +608,10 @@ if have_gumjs
     'tests=false',
   ])
 
-  libtcc_dep = dependency('libtcc', required: host_arch not in ['mips', 'mips64'])
+  libtcc_dep = dependency('libtcc',
+    required: (host_abi in ['arm', 'arm64'] and host_machine.endian() == 'little')
+              or (host_abi not in ['arm', 'arm64'] and host_arch not in ['mips', 'mips64'])
+  )
   cdata.set('HAVE_TINYCC', libtcc_dep.found())
 
   if host_arch == 'arm' and cc.has_function('__aeabi_memmove')
@@ -615,18 +620,6 @@ if have_gumjs
 
   sqlite_dep = dependency('sqlite3', required: get_option('database'))
   cdata.set('HAVE_SQLITE', sqlite_dep.found())
-
-  if get_option('frida_objc_bridge').allowed()
-    cdata.set('HAVE_OBJC_BRIDGE', 1)
-  endif
-
-  if get_option('frida_swift_bridge').allowed()
-    cdata.set('HAVE_SWIFT_BRIDGE', 1)
-  endif
-
-  if get_option('frida_java_bridge').allowed()
-    cdata.set('HAVE_JAVA_BRIDGE', 1)
-  endif
 
   libsoup_dep = dependency('libsoup-3.0', default_options: [
     'gssapi=disabled',
@@ -640,15 +633,6 @@ if have_gumjs
     'tests=false',
     'sysprof=disabled',
   ])
-
-  node = find_program('node', version: '>=18.0.0', native: true, required: false)
-  if not node.found()
-    error('Need Node.js >= 18.0.0 to process JavaScript code at build time')
-  endif
-  npm = find_program('npm', native: true, required: false)
-  if not npm.found()
-    error('Need npm to process JavaScript code at build time')
-  endif
 else
   v8_dep = disabler()
 endif
